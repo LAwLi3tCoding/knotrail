@@ -6,7 +6,7 @@ import type { Runner, RunnerCallbacks, RunnerRequest, RunnerResult, RunControl, 
 /** One isolated pi SDK session per Run. Tool effects remain owned by the Coordinator. */
 export class PiRunner implements Runner {
   async run(request: RunnerRequest, callbacks: RunnerCallbacks, signal: AbortSignal): Promise<RunnerResult> {
-    if (signal.aborted) return { summary: 'Run cancelled', turns: 0, usage: { input: 0, output: 0 }, aborted: true };
+    if (signal.aborted) return { summary: 'Run cancelled', turns: 0, aborted: true };
     const bundled = fileURLToPath(new URL('./pi-worker.mjs', import.meta.url));
     const source = fileURLToPath(new URL('./pi-worker.ts', import.meta.url));
     const child = fork(existsSync(bundled) ? bundled : source, [], {
@@ -52,7 +52,7 @@ export class PiRunner implements Runner {
       child.once('close', async code => {
         clearTimeout(deadline); clearTimeout(killTimer); signal.removeEventListener('abort', abort);
         await pending;
-        if (cancelled) return resolve({ ...result, summary: result?.summary || 'Run cancelled or timed out', turns: result?.turns || 0, usage: result?.usage || { input: 0, output: 0 }, aborted: true });
+        if (cancelled) return resolve({ ...result, summary: result?.summary || 'Run cancelled or timed out', turns: result?.turns || 0, usage: result?.usage?{...result.usage,partial:true}:undefined, aborted: true });
         if (failure || code !== 0 || !result) return reject(new Error(failure || clean(stderr) || `pi worker exited (${code})`));
         resolve(result);
       });

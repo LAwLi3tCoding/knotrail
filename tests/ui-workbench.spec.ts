@@ -64,7 +64,11 @@ async function start(page: Page) {
             case 'task.previewRevision': return { id: 'impact-fixture', taskId: data.task.id, expectedRevision: data.task.revision, expectedPlanId: data.plan?.id, workspaceDigest: 'workspace', objective: command.objective, affected: ['edit', 'verify'], retained: ['research'], reason: 'Legacy configuration support changes adapter and checks.' };
             case 'task.previewRetry': return { id: 'retry-fixture', taskId: data.task.id, expectedRevision: data.task.revision, expectedPlanId: data.plan?.id, workspaceDigest: 'workspace', nodeId: command.nodeId, affected: [command.nodeId], retained: [], reason: 'The selected step must run again.' };
             case 'task.applyImpact': data.task.revision++; if (command.preview.objective) data.task.objective = command.preview.objective; data.lastSequence++; notify(); return data;
-            case 'decision.answer': { const decision = data.decisions.find(item => item.id === command.decisionId); if (decision) decision.answer = command.answer; data.task.status = 'executing'; data.lastSequence++; notify(); return data; }
+            case 'task.inspectEffects': {
+              data.decisions.push({ id: 'terminal-recovery', kind: 'recovery', taskId: data.task.id, taskRevision: data.task.revision, planId: data.plan?.id, question: 'Inspect unknown terminal effects.', options: ['preserve-and-stop'], recovery: { actionIds: ['action-1'], actionsDigest: 'actions-digest', workspaceDigest: 'workspace-digest', artifactId: 'artifact-1', terminalStatus: 'cancelled' }, createdAt });
+              data.lastSequence++; notify(); return data;
+            }
+            case 'decision.answer': { const decision = data.decisions.find(item => item.id === command.decisionId); if (decision) decision.answer = command.answer; data.task.status = decision?.recovery?.terminalStatus ?? 'executing'; data.lastSequence++; notify(); return data; }
             case 'task.files': return { files: ['src/adapter.ts', 'README.md'] };
             case 'task.readFile': return { content: 'export const adapter = "safe";', truncated: false };
             case 'model.check': return { ok: true, message: 'Connection passed' };
@@ -185,4 +189,95 @@ test('narrow screens use a right drawer with keyboard containment, no horizontal
   await page.setViewportSize({ width: 390, height: 844 });
   await page.getByRole('button', { name: 'Expand navigation' }).click();
   await expect(page.getByRole('button', { name: /Upgrade the adapter/ })).toBeVisible();
+});
+
+test('recovery decisions show evidence, translate host choices, and inspect terminal effects without resuming', async ({ page }) => {
+  await start(page);
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, status: 'waiting_user' }, artifacts: [{ ...state.snapshot.artifacts[0]!, content: 'Unknown action: call-1 run_command\nCurrent diff:\n+ preserved edit' }], decisions: [{ id: 'recovery-1', kind: 'recovery', taskId: 'task-1', taskRevision: 1, planId: 'plan-1', question: 'Host recovery question', options: ['preserve-and-replan', 'stop-task'], recovery: { actionIds: ['action-1'], actionsDigest: 'actions-digest', workspaceDigest: 'workspace-digest', artifactId: 'artifact-1' }, createdAt: '2026-09-06T09:00:00Z' }] });
+  });
+  const card = page.locator('.conversation .decision-card');
+  await expect(card.getByRole('button', { name: 'Preserve files and replan', exact: true })).toBeVisible();
+  await expect(card.getByRole('button', { name: 'Stop task', exact: true })).toBeVisible();
+  await expect(card.locator('pre')).toContainText('Unknown action: call-1 run_command');
+  await expect(card.locator('pre')).toContainText('+ preserved edit');
+  await expect(card).toContainText('artifact-1');
+  await page.getByRole('combobox', { name: 'Language', exact: true }).selectOption('zh-CN');
+  await expect(card).toContainText('保留文件不代表确认此前操作成功');
+  await expect(card.getByRole('button', { name: '停止任务', exact: true })).toBeVisible();
+  await expect(card.getByText('恢复证据', { exact: true })).toBeVisible();
+  await card.getByRole('button', { name: '保留文件并重新规划', exact: true }).click();
+  await expect(card).toHaveCount(0);
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, status: 'cancelled' }, runs: state.snapshot.runs.map(run => run.status === 'running' ? { ...run, status: 'aborted' } : run), actions: [{ ...state.snapshot.actions[0]!, name: 'run_command', status: 'unknown' }] });
+  });
+  await expect(page.getByRole('button', { name: '继续', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: '查看未确认的操作影响', exact: true }).click();
+  await expect(card).toContainText('任务将保持终止');
+  await expect(card.getByRole('button', { name: '保留文件并保持终止', exact: true })).toBeVisible();
+  await page.getByRole('combobox', { name: '界面语言', exact: true }).selectOption('en');
+  await expect(page.getByRole('button', { name: 'Inspect unknown effects', exact: true })).toBeVisible();
+  await page.screenshot({ path: test.info().outputPath('terminal-recovery.png') });
+  await card.getByRole('button', { name: 'Preserve files and keep stopped', exact: true }).click();
+  await expect(card).toHaveCount(0);
+  const state = await page.evaluate(() => (window as unknown as { uiTest: { commands: AppCommand[]; snapshot: TaskSnapshot } }).uiTest);
+  expect(state.snapshot.task.status).toBe('cancelled');
+  expect(state.commands.filter(command => command.type === 'decision.answer').map(command => command.answer)).toEqual(['preserve-and-replan', 'preserve-and-stop']);
+  expect(state.commands.some(command => command.type === 'task.inspectEffects')).toBe(true);
+  expect(state.commands.some(command => command.type === 'task.resume')).toBe(false);
+});
+
+test('check receipts distinguish current bindings from history and missing usage is visible', async ({ page }) => {
+  await start(page);
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    const current = { id: 'current', batchId: 'batch-current', scope: 'node' as const, taskRevision: 1, planId: 'plan-1', checksDigest: 'checks-current', taskId: 'task-1', nodeId: 'edit', runId: 'run-2', conditionId: 'test', result: 'pass' as const, inputDigest: 'verified-source-digest', output: 'Current check output', checkedAt: '2026-09-06T09:00:00Z' };
+    state.change({ checks: [current, { ...current, id: 'old-plan', planId: 'plan-0', output: 'Old plan check output' }, { ...current, id: 'old-run', runId: 'run-old', output: 'Old attempt check output' }, { id: 'legacy', taskId: 'task-1', nodeId: 'edit', runId: 'run-2', conditionId: 'test', result: 'pass', inputDigest: 'legacy-source', output: 'Legacy check output', checkedAt: current.checkedAt }] });
+  });
+  await page.locator('.composer-footer summary').click();
+  await expect(page.locator('.composer-footer dd').nth(1)).toHaveText('1,234 · Partial usage');
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({runs:state.snapshot.runs.map(run=>({...run,usage:{input:3,output:2,partial:true}}))});
+  });
+  await expect(page.locator('.composer-footer dd').nth(1)).toContainText('Partial usage');
+  await page.getByRole('button', { name: 'Planning', exact: true }).click();
+  await page.getByRole('button', { name: 'Steps', exact: true }).click();
+  await page.getByRole('button', { name: /Update the adapter.*Edit/ }).click();
+  await page.getByRole('button', { name: 'Checks', exact: true }).click();
+  const receipts = page.locator('.node-detail .receipt');
+  await expect(receipts).toHaveCount(4);
+  await expect(receipts.getByText('Current', { exact: true })).toHaveCount(1);
+  await expect(receipts.getByText('Historical', { exact: true })).toHaveCount(3);
+  await expect(receipts.locator('.status-pass')).toHaveCount(1);
+  await receipts.first().locator('summary').click();
+  for (const binding of ['batch-current', 'plan-1', 'verified-source-digest', 'checks-current', 'run-2']) await expect(receipts.first()).toContainText(binding);
+  await receipts.last().locator('summary').click();
+  await expect(receipts.last()).toContainText('Not recorded');
+  await page.getByRole('combobox', { name: 'Language', exact: true }).selectOption('zh-CN');
+  await expect(receipts.getByText('历史记录', { exact: true })).toHaveCount(3);
+  await expect(receipts.first()).toContainText('批次');
+  await page.screenshot({ path: test.info().outputPath('checks-current-and-history-zh.png') });
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ nodes: state.snapshot.nodes.map(node => node.nodeId === 'edit' ? { ...node, status: 'stale' } : node), runs: state.snapshot.runs.map(run => ({ ...run, usage: undefined })) });
+  });
+  await expect(receipts.getByText('历史记录', { exact: true })).toHaveCount(4);
+  await expect(receipts.locator('.status-pass')).toHaveCount(0);
+  await expect(page.locator('.composer-footer dd').nth(1)).toHaveText('不可用');
+});
+
+test('acceptance copy is translated without translating model-authored choices', async ({ page }) => {
+  await start(page);
+  await page.getByRole('combobox', { name: 'Language', exact: true }).selectOption('zh-CN');
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, status: 'waiting_user' }, decisions: [{ id: 'acceptance-1', kind: 'acceptance', taskId: 'task-1', taskRevision: 1, question: 'Host acceptance question', options: ['accept', 'reject'], createdAt: '2026-09-06T09:00:00Z' }, { id: 'model-1', kind: 'model', taskId: 'task-1', taskRevision: 1, question: 'Model-authored question?', options: ['accept'], createdAt: '2026-09-06T09:00:00Z' }] });
+  });
+  await expect(page.getByRole('button', { name: '接受结果', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '不接受结果', exact: true })).toBeVisible();
+  await expect(page.getByText('Model-authored question?', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'accept', exact: true })).toBeVisible();
 });

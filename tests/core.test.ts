@@ -72,3 +72,82 @@ test('an absolute task deadline cannot race the final node into completed',async
  const slow:Runner={async run(_r,c,signal){await new Promise(resolve=>setTimeout(resolve,350));if(!signal.aborted)await c.onControl({kind:'complete',summary:'late'});return {summary:'late',turns:1,usage:{input:0,output:0},aborted:signal.aborted};}};(app as any).runner=slow;app.store.update(created.task.id,s=>{s.task.expiresAt=new Date(Date.now()+150).toISOString();});
  await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const expired=await until(app,created.task.id,s=>['expired','completed'].includes(s.task.status));assert.equal(expired.task.status,'expired');assert.equal(expired.task.acceptedDigest,undefined);
 });
+
+test('a change after the final check receipt cannot be accepted as checked output', async t => {
+ const {app,project}=await setup(t);
+ const originalNotify=(app as any).options.notify;
+ let changed=false;
+ (app as any).options.notify=(event:any)=>{originalNotify(event);if(!event.taskId)return;const current=app.store.get(event.taskId);const last=current.events.at(-1);if(!changed&&last?.kind==='check.finished'&&!last.nodeId){changed=true;writeFileSync(join(current.task.workdir,'sample.txt'),'external after verification\n');}};
+ const created=await app.command(create(project,{executionPolicy:'autoWithinGrant'})) as TaskSnapshot;
+ const end=await until(app,created.task.id,s=>['completed','blocked'].includes(s.task.status));
+ assert.ok(changed);assert.equal(end.task.status,'blocked');assert.equal(end.task.acceptedDigest,undefined);assert.match(end.task.error!,/changed|stale|verification/i);
+});
+
+test('checks from different workspace revisions cannot form one successful acceptance batch', async t=>{
+ const runner:Runner={async run(r,c,signal){if(r.purpose==='planning')await c.onControl({kind:'update_plan',draft:{...draft,nodes:[{...draft.nodes[0]!,checkIds:['first','second']}]},submit:true});else await c.onControl({kind:'complete',summary:'Review both conditions'});return {summary:'fixture',turns:1,usage:{input:0,output:0},aborted:signal.aborted};}};
+ const {app,project}=await setup(t,runner);
+ (app as any).executor={execute:async(call:any,options:any)=>{const content=readFileSync(join(options.workdir,'sample.txt'),'utf8');return {text:'Observed '+content,isError:content!==call.args.argv[0]};}};
+ (app as any).options.notify=(event:any)=>{if(!event.taskId)return;const s=app.store.get(event.taskId);const last=s.events.at(-1);if(last?.kind==='check.finished'&&(last.data as any).conditionId==='first')writeFileSync(join(s.task.workdir,'sample.txt'),'updated\n');if(last?.kind==='check.finished'&&(last.data as any).conditionId==='second'&&last.nodeId)writeFileSync(join(s.task.workdir,'sample.txt'),'original\n');};
+ const created=await app.command(create(project,{executionPolicy:'autoWithinGrant',checks:[{id:'first',label:'Requires original',command:['original\n'],protectedPaths:[]},{id:'second',label:'Requires updated',command:['updated\n'],protectedPaths:[]}]})) as TaskSnapshot;
+ const end=await until(app,created.task.id,s=>['completed','blocked'].includes(s.task.status));assert.equal(end.task.status,'blocked');assert.equal(end.task.acceptedDigest,undefined);
+});
+
+test('a planner candidate is not published when its source changed before worker shutdown',async t=>{
+ const runner:Runner={async run(r,c,signal){await c.onControl({kind:'update_plan',draft:structuredClone(draft),submit:true});writeFileSync(join(r.workdir,'sample.txt'),'concurrent source change\n');return {summary:'candidate',turns:1,usage:{input:0,output:0},aborted:signal.aborted};}};
+ const {app,project}=await setup(t,runner);const created=await app.command(create(project)) as TaskSnapshot;
+ const end=await until(app,created.task.id,s=>['ready','blocked'].includes(s.task.status));assert.equal(end.task.status,'blocked');assert.equal(end.plan,undefined);assert.equal(end.plans.length,0);assert.ok(end.draft);
+});
+
+function uncertainAction(app:AppService,taskId:string,name='write_file') {
+ app.store.update(taskId,s=>{s.actions.push({id:id(),taskId,runId:s.runs[0]!.id,nodeId:'edit',toolCallId:id(),name,argsDigest:'unavailable',status:'unknown',startedAt:now()});s.task.status='blocked';});
+}
+test('unknown effects freeze resume and every impact path until a bound recovery decision',async t=>{
+ const {app,project}=await setup(t);const created=await app.command(create(project)) as TaskSnapshot;await until(app,created.task.id,s=>s.task.status==='ready');
+ const preview=await app.command({type:'task.previewRetry',taskId:created.task.id,nodeId:'edit',expectedRevision:1}) as ImpactPreview;uncertainAction(app,created.task.id);
+ await assert.rejects(app.command({type:'task.applyImpact',requestId:id(),preview}),/unknown effects/i);
+ for(const command of [{type:'task.previewRetry',nodeId:'edit'},{type:'task.previewRevision',objective:'New objective'}])await assert.rejects(app.command({...command,taskId:created.task.id,expectedRevision:1}),/unknown effects/i);
+ const waiting=await app.command({type:'task.snapshot',taskId:created.task.id}) as TaskSnapshot;assert.equal(waiting.task.status,'waiting_user');assert.equal(waiting.runs.length,1);assert.equal(readFileSync(join(waiting.task.workdir,'sample.txt'),'utf8'),'original\n');
+ const decision=waiting.decisions.find(d=>d.kind==='recovery')!;assert.ok(decision);assert.ok(waiting.artifacts.some(a=>a.id===decision.recovery?.artifactId));
+ writeFileSync(join(waiting.task.workdir,'sample.txt'),'user kept this\n');await assert.rejects(app.command({type:'decision.answer',requestId:id(),taskId:created.task.id,decisionId:decision.id,answer:'preserve-and-replan',expectedRevision:1}),/changed/);
+ await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const refreshed=await app.command({type:'task.snapshot',taskId:created.task.id}) as TaskSnapshot;const next=refreshed.decisions.find(d=>d.kind==='recovery'&&!d.answer)!;
+ assert.notEqual(next.id,decision.id);await app.command({type:'decision.answer',requestId:id(),taskId:created.task.id,decisionId:next.id,answer:'preserve-and-replan',expectedRevision:1});const ready=await until(app,created.task.id,s=>s.task.status==='ready');assert.equal(ready.task.revision,2);assert.equal(ready.actions[0]!.status,'unknown');assert.equal(ready.actions[0]!.resolution?.decisionId,next.id);assert.equal(readFileSync(join(ready.task.workdir,'sample.txt'),'utf8'),'user kept this\n');assert.equal(ready.runs.length,2);
+});
+test('an unknown read does not create a false unknown-effect gate',async t=>{
+ const {app,project}=await setup(t);const created=await app.command(create(project)) as TaskSnapshot;await until(app,created.task.id,s=>s.task.status==='ready');uncertainAction(app,created.task.id,'read_file');await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const done=await until(app,created.task.id,s=>['completed','waiting_user','blocked'].includes(s.task.status));assert.equal(done.task.status,'completed');assert.equal(done.decisions.length,0);
+});
+test('a lost receipt after a file effect aborts admission and cannot replay with a new tool call ID',async t=>{
+ let admitted=0;
+ const runner:Runner={async run(r,c,signal){if(r.purpose==='planning'){await c.onControl({kind:'update_plan',draft,submit:true});}else{for(let i=0;i<2;i++){try{await c.onTool({toolCallId:id(),name:'write_file',args:{path:'sample.txt',content:'updated\n'}});}catch{}}await c.onControl({kind:'complete',summary:'not authoritative'});}return {summary:'fixture',turns:1,usage:{input:0,output:0},aborted:signal.aborted};}};
+ const {app,project}=await setup(t,runner);(app as any).executor={async execute(...args:Parameters<Executor['execute']>){admitted++;return executor.execute(...args);}};
+ const put=app.store.put.bind(app.store);let failed=false;app.store.put=(s)=>{if(!failed&&s.actions.some(a=>a.name==='write_file'&&a.status==='succeeded')){failed=true;throw new Error('Injected receipt commit failure');}put(s);};
+ const created=await app.command(create(project,{executionPolicy:'autoWithinGrant'})) as TaskSnapshot;const blocked=await until(app,created.task.id,s=>['completed','blocked'].includes(s.task.status));assert.equal(blocked.task.status,'blocked');assert.equal(admitted,1);assert.equal(blocked.actions[0]!.status,'unknown');assert.equal(readFileSync(join(blocked.task.workdir,'sample.txt'),'utf8'),'updated\n');
+ await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const waiting=await app.command({type:'task.snapshot',taskId:created.task.id}) as TaskSnapshot;assert.equal(waiting.task.status,'waiting_user');assert.equal(admitted,1);
+});
+test('terminal tasks can dispose unknown effects without starting another run',async t=>{
+ const {app,project}=await setup(t);const created=await app.command(create(project)) as TaskSnapshot;await until(app,created.task.id,s=>s.task.status==='ready');uncertainAction(app,created.task.id,'run_command');await app.command({type:'task.cancel',taskId:created.task.id,expectedRevision:1});
+ await app.command({type:'task.inspectEffects',taskId:created.task.id});const cancelled=await app.command({type:'task.snapshot',taskId:created.task.id}) as TaskSnapshot;assert.equal(cancelled.task.status,'cancelled');const decision=cancelled.decisions.find(d=>d.kind==='recovery'&&!d.answer)!;assert.deepEqual(decision.options,['preserve-and-stop']);
+ const answer={type:'decision.answer',requestId:id(),taskId:created.task.id,decisionId:decision.id,answer:'preserve-and-stop',expectedRevision:1};await app.command(answer);await app.command(answer);const done=await app.command({type:'task.snapshot',taskId:created.task.id}) as TaskSnapshot;assert.equal(done.task.status,'cancelled');assert.equal(done.runs.length,1);assert.equal(done.actions[0]!.status,'unknown');assert.equal(done.actions[0]!.resolution?.disposition,'preserve-and-stop');await assert.rejects(app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1}),/terminal/);
+});
+test('failed pending persistence cannot admit the effect; failed artifact persistence cannot complete',async t=>{
+ for(const failure of ['pending','artifact']){const {app,project}=await setup(t);const put=app.store.put.bind(app.store);let injected=false,calls=0;(app as any).executor={async execute(...args:Parameters<Executor['execute']>){calls++;return executor.execute(...args);}};
+ app.store.put=s=>{if(!injected&&(failure==='pending'?s.actions.some(a=>a.status==='pending'):s.artifacts.length)){injected=true;throw new Error('Injected '+failure+' persistence failure');}put(s);};
+ const created=await app.command(create(project,{executionPolicy:'autoWithinGrant'})) as TaskSnapshot;const done=await until(app,created.task.id,s=>['completed','blocked'].includes(s.task.status));assert.equal(done.task.status,'blocked');assert.equal(done.task.acceptedDigest,undefined);if(failure==='pending')assert.equal(calls,0);else assert.equal(done.artifacts.length,0);
+ }
+});
+test('an unknown check command prevents timer wake and other task effects',async t=>{
+ const {app,project}=await setup(t);const first=await app.command(create(project,{mode:'finite',intervalMinutes:1,expiresAt:new Date(Date.now()+60000).toISOString()})) as TaskSnapshot;await until(app,first.task.id,s=>s.task.status==='ready');uncertainAction(app,first.task.id,'required_check');app.store.update(first.task.id,s=>{s.task.status='waiting_external';s.task.nextCheckAt=new Date(0).toISOString();});(app as any).wake();const waiting=await until(app,first.task.id,s=>s.task.status==='waiting_user');assert.equal(waiting.runs.length,1);
+ const second=await app.command(create(project,{executionPolicy:'autoWithinGrant'})) as TaskSnapshot;const blocked=await until(app,second.task.id,s=>s.task.status==='blocked');assert.equal(blocked.runs.length,0);assert.match(blocked.task.error!,/unknown command effects/i);
+});
+test('a failed recovery disposition commit leaves the effect gate closed',async t=>{
+ const {app,project}=await setup(t);const created=await app.command(create(project)) as TaskSnapshot;await until(app,created.task.id,s=>s.task.status==='ready');uncertainAction(app,created.task.id);await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const waiting=await app.command({type:'task.snapshot',taskId:created.task.id}) as TaskSnapshot;const decision=waiting.decisions.find(d=>d.kind==='recovery')!;
+ const put=app.store.put.bind(app.store);app.store.put=s=>{if(s.actions.some(a=>a.resolution))throw new Error('Injected disposition persistence failure');put(s);};await assert.rejects(app.command({type:'decision.answer',requestId:id(),taskId:created.task.id,decisionId:decision.id,answer:'preserve-and-replan',expectedRevision:1}),/persistence/);const unchanged=await app.command({type:'task.snapshot',taskId:created.task.id}) as TaskSnapshot;assert.equal(unchanged.task.status,'waiting_user');assert.equal(unchanged.actions[0]!.resolution,undefined);assert.equal(unchanged.runs.length,1);
+});
+test('source changes after Ready require a new plan before the first node can run',async t=>{
+ const {app,project}=await setup(t);const created=await app.command(create(project)) as TaskSnapshot;const first=await until(app,created.task.id,s=>s.task.status==='ready');writeFileSync(join(first.task.workdir,'sample.txt'),'changed after ready\n');await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const next=await until(app,created.task.id,s=>s.task.status==='ready'||s.task.status==='completed');assert.equal(next.task.status,'ready');assert.equal(next.plans.length,2);assert.equal(next.actions.length,0);assert.equal(readFileSync(join(next.task.workdir,'sample.txt'),'utf8'),'changed after ready\n');
+});
+test('foreign unknown commands cannot turn a terminal task into a resumable task',async t=>{
+ const {app,project}=await setup(t);const a=await app.command(create(project)) as TaskSnapshot;await until(app,a.task.id,s=>s.task.status==='ready');await app.command({type:'task.cancel',taskId:a.task.id,expectedRevision:1});
+ const b=await app.command(create(project)) as TaskSnapshot;await until(app,b.task.id,s=>s.task.status==='ready');uncertainAction(app,b.task.id,'run_command');await app.command({type:'task.cancel',taskId:b.task.id,expectedRevision:1});
+ const inspected=await app.command({type:'task.inspectEffects',taskId:a.task.id}) as TaskSnapshot;assert.equal(inspected.task.status,'cancelled');assert.equal(inspected.runs.length,1);
+ const recovery=await app.command({type:'task.inspectEffects',taskId:b.task.id}) as TaskSnapshot;await app.command({type:'decision.answer',requestId:id(),taskId:b.task.id,decisionId:recovery.decisions.find(d=>d.kind==='recovery')!.id,answer:'preserve-and-stop',expectedRevision:1});await assert.rejects(app.command({type:'task.resume',taskId:a.task.id,expectedRevision:1}),/terminal/);
+});

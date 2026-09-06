@@ -19,7 +19,7 @@ const schemas:Record<string,z.ZodType>={
  'settings.save':z.object({type:z.literal('settings.save'),patch:z.object({locale:z.enum(['system','zh-CN','en']).optional(),planningOpen:z.boolean().optional(),responseLanguage:z.enum(['task','zh-CN','en']).optional(),allowNetwork:z.boolean().optional(),model:z.object({baseUrl:z.url().refine(v=>{const u=new URL(v);return !u.username&&!u.password&&!u.search&&!u.hash&&(u.protocol==='https:'||(u.protocol==='http:'&&['127.0.0.1','localhost','[::1]'].includes(u.hostname)));},'Use HTTPS or a loopback HTTP endpoint without embedded credentials'),modelId:key,apiKey:secret,thinking:z.enum(['off','low','medium','high']),contextWindow:z.number().int().min(4096).max(2_000_000),maxTokens:z.number().int().min(128).max(100_000)}).partial().strict().optional()}).strict()}).strict(),
  'model.check':z.object({type:z.literal('model.check')}).strict(),
 };
-for(const type of ['task.snapshot','task.files','task.export','preferences.get']) schemas[type]=z.object({type:z.literal(type),taskId:key}).strict();
+for(const type of ['task.snapshot','task.inspectEffects','task.files','task.export','preferences.get']) schemas[type]=z.object({type:z.literal(type),taskId:key}).strict();
 for(const type of ['task.pause','task.resume','task.cancel']) schemas[type]=z.object({type:z.literal(type),taskId:key,expectedRevision:revision}).strict();
 export function parseCommand(input:unknown):AppCommand { const type=(input as {type?:string})?.type; if(!type||!schemas[type]) throw new Error('Unsupported command'); return schemas[type].parse(input) as AppCommand; }
 export function validatePlan(input:unknown, checks:CheckSpec[], committed = true):PlanDraft {

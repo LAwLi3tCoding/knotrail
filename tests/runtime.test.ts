@@ -9,7 +9,7 @@ import { PiRunner } from '../src/runtime/pi-runner.js';
 import type { RunnerRequest, RunControl, ToolCall } from '../src/runtime/contracts.js';
 
 const draft = { sequence: 1, summary: 'Inspect fixture', observations: [{ kind: 'fact', text: 'Fixture exists' }], nodes: [{ id: 'inspect', title: 'Inspect', goal: 'Read fixture', dependsOn: [], kind: 'research', inputs: ['fixture.txt'], outputs: ['report'], checkIds: [] }] };
-async function fixture(t: { after(fn: () => Promise<void>): void }, responses: { name?: string; args?: unknown; text?: string }[][]) {
+async function fixture(t: { after(fn: () => Promise<void>): void }, responses: { name?: string; args?: unknown; text?: string }[][], reported?: boolean[]) {
   const root = await mkdtemp(join(tmpdir(), 'knotrail-runtime-')); await mkdir(join(root, 'session'));
   const requests: Record<string, any>[] = [];
   const server = createServer(async (req, res) => {
@@ -21,7 +21,7 @@ async function fixture(t: { after(fn: () => Promise<void>): void }, responses: {
     const calls = chunks.filter(item => item.name);
     const delta = { content: chunks.map(item => item.text || '').join(''), ...(calls.length ? { tool_calls: calls.map((item, i) => ({ index: i, id: `call-${index}-${i}`, type: 'function', function: { name: item.name, arguments: JSON.stringify(item.args) } })) } : {}) };
     res.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`);
-    res.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta: {}, finish_reason: calls.length ? 'tool_calls' : 'stop' }], usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 } })}\n\n`);
+    res.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta: {}, finish_reason: calls.length ? 'tool_calls' : 'stop' }], ...(reported?.[index]===false?{}:{usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 }}) })}\n\n`);
     res.end('data: [DONE]\n\n');
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -38,7 +38,7 @@ test('real pi SDK streams planning with only read-only tools and closes admissio
   await writeFile(join(f.root, '.pi', 'extensions', 'poison.ts'), "throw new Error('Extension discovery must stay disabled')");
   const calls: ToolCall[] = [], controls: RunControl[] = [], events: string[] = [];
   const result = await new PiRunner().run(f.request, { onEvent: (_kind, text) => events.push(text), onTool: async call => { calls.push(call); return { text: 'fixture' }; }, onControl: async control => { controls.push(control); return { text: 'accepted' }; } }, new AbortController().signal);
-  assert.equal(result.aborted, false); assert.equal(result.turns, 2); assert.ok(result.sessionPath); assert.ok(result.usage.input > 0);
+  assert.equal(result.aborted, false); assert.equal(result.turns, 2); assert.ok(result.sessionPath); assert.ok(result.usage && result.usage.input > 0);
   assert.equal((await readFile(result.sessionPath!, 'utf8')).includes(f.request.model.apiKey!), false);
   assert.deepEqual(calls.map(call => call.args.path), ['fixture.txt']); assert.equal(controls.length, 1); assert.ok(events.join('').includes('inspect'));
   const names = f.requests[0].tools.map((tool: { function: { name: string } }) => tool.function.name).sort();
@@ -70,4 +70,12 @@ test('aborting a pi Run waits for an admitted parent tool to finish cleanup', as
     onEvent() {}, onTool: async () => { controller.abort(); await new Promise(resolve => setTimeout(resolve, 80)); cleaned = true; return { text: 'cancelled', isError: true }; }, onControl: async () => ({ text: 'unexpected', isError: true }),
   }, controller.signal);
   assert.equal(result.aborted, true); assert.equal(cleaned, true);
+});
+
+test('real pi usage stays unknown or partial when provider responses omit token counts',async t=>{
+ for(const reported of [[false,false],[true,false]]){
+  const f=await fixture(t,[[{name:'read_file',args:{path:'fixture.txt'}}],[{name:'update_plan',args:{draft,submit:true}}]],reported);
+  const result=await new PiRunner().run(f.request,{onEvent(){},onTool:async()=>({text:'fixture'}),onControl:async()=>({text:'accepted'})},new AbortController().signal);
+  assert.equal(result.turns,2);if(reported[0])assert.deepEqual(result.usage,{input:12,output:8,partial:true});else assert.equal(result.usage,undefined);
+ }
 });

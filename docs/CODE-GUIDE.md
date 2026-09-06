@@ -51,7 +51,8 @@ interface DesktopAPI {
 | `task.create` | requestId、项目、目标、检查、策略、模式和预算 | 新快照；独立工作树；进入只读规划 |
 | `task.snapshot` | taskId | 完整持久化快照 |
 | `task.pause` / `task.cancel` | taskId、expectedRevision | 关闭准入、等待实际收尾后暂停或取消 |
-| `task.resume` | taskId、expectedRevision | 重核文件证据，再从当前文件继续 |
+| `task.resume` | taskId、expectedRevision | 先查证未知效果，再核对文件证据并继续 |
+| `task.inspectEffects` | taskId | 展示未知效果的绑定证据；终态任务也可查证，不启动 Run |
 | `task.previewRevision` | 新目标与 expectedRevision | 停止并生成一次性影响预览 |
 | `task.previewRetry` | nodeId 与 expectedRevision | 计算本节点和后继失效集合 |
 | `task.applyImpact` | requestId 与完整签发预览 | 校验原件、版本和摘要；原子消费；继续 |
@@ -76,10 +77,10 @@ App new-task form
   → enqueue() → pump() → drive()
   → run(purpose=planning)
   → PiRunner.run() → pi-worker → createAgentSession()
-  → update_plan → validatePlan() → append PlanRevision
-  → Worker exit → ready
+  → update_plan → validatePlan() → save candidate draft
+  → Worker exit → verify source/revision → append PlanRevision + ready
   → policy auto / user resume
-  → run(purpose=node) → onTool() → pending receipt
+  → run(purpose=node) → onTool() → executeRecorded() → pending receipt
   → SandboxExecutor.execute() → helper
   → outcome complete → check(node)
   → next node / finalize() → check(all)
@@ -95,6 +96,8 @@ App new-task form
 Worker 使用已固定版本的 `@earendil-works/pi-coding-agent`。项目和全局扩展、默认工具、技能和资源自动发现被关闭；只注册 Knotrail 明确提供的工具。配置显式构造 OpenAI-compatible Chat Completions 模型，支持自定义 baseUrl、modelId、thinking、contextWindow 和 maxTokens。
 
 `turn.started` 在实际模型轮开始时写入持久预算；`assistant.delta` 用于公开文字流。工具执行与控制请求通过带消息 ID 的 RPC 排队，父进程返回 `ToolResult`。一次终止结果被接受后，双方都关闭后续准入。
+
+`RunnerResult.usage` 可缺省，部分已知计数携带 `partial=true`。pi 将缺失用量补为零，因此 Worker 保守地把零总量响应视为未测得；全程未测得时不返回 usage，部分测得时保留计数并标 partial。取消分支不创建零用量，Renderer 只汇总有记录的值并提示缺失。
 
 `RunnerResult` 返回 summary、sessionPath、turns、usage、aborted。不存在结构化终止结果、达到轮数上限、模型出错或 Worker 异常退出，都会成为失败路径，不靠最后一段自然语言猜测完成。
 
@@ -113,13 +116,19 @@ Worker 使用已固定版本的 `@earendil-works/pi-coding-agent`。项目和全
 
 文件写入先检查目标和父目录，拒绝越界、符号链接、`.git` 与 protectedPaths，再验证预期版本。helper 写临时文件，在替换前重查目标，随后 rename；保留已有文件的执行权限。模型拿到截断文本时可以使用 hash，避免必须回传整份旧文件。
 
-用户的 `CheckSpec.command` 与工具参数不同：它在 Core 中转换为 `run_command.args.argv`。固定检查不经过模型改写。检查前后摘要不同则记录 fail，即使命令 exit code 为零也不会认作有效验收。
+用户的 `CheckSpec.command` 与工具参数不同：它在 Core 中转换为 `run_command.args.argv`。固定检查不经过模型改写。`check()` 为整批验收创建唯一 batchId，冻结 taskRevision、planId、checksDigest、inputDigest。每条回执都携带这些绑定。`batchCurrent()` 在检查前后及节点/任务落状态时复核；任何绑定变化会阻止成功，即使命令 exit code 为零。acceptedDigest 不重新读取一个未验证的摘要。
 
 ## 6. 持久化和恢复
 
 `Store.update()` 在同步 SQLite 事务中读取任务 JSON、执行同步修改、保存并提交。不在事务中 await。任务创建、影响应用与决定回答把去重请求和对应状态一起提交。事件在同一次更新中追加，seq 严格递增。
 
-异步效果前先持久化 pending。结果写回 succeeded、failed 或 unknown；应用重建时扫描尚在 running/pending 的记录，将其标记 unknown，并进入 blocked。恢复不会自动重放命令。用户继续时重新计算工作树摘要，必要时把既有 verified 节点变为 stale。
+异步效果前先持久化 pending。`executeRecorded()` 是模型工具和固定检查共用的回执入口。准入后的执行异常或结果写入失败标记 unknown；工具回调关闭 admission 并触发独立 fault AbortController，随后外层等待实际收尾。pending 写入失败时执行器不会被调用。
+
+`unresolved()` 从动作回执计算未处置效果，不依赖节点是否被改为 stale。`requireRecovery()` 覆盖 Resume、修改/重试、drive、最终验收和决定处理，执行器准入另有检查。未知命令会冻结其他任务的新效果；未知只读动作不会触发该门。
+
+恢复卡片是 `Decision.kind=recovery`，绑定 actionIds、actionsDigest、workspaceDigest 和证据 artifactId，Task/Plan 版本由 Decision 绑定。`decision.answer` 复核后，在一个事务中保存 resolution、回答和 requestId。保留并重新规划会创建新 TaskRevision；终态的 preserve-and-stop 只保存处置、保持终态。原 action.status 仍是 unknown。处置失败或证据变化不能解锁效果。
+
+acceptance、model、recovery 使用显式 kind 分派，模型不能用问题文本伪装成宿主验收。当前恢复仍依赖用户查证；没有从 diff 推断命令未发生，也没有通用 exactly-once 保证。
 
 工作树创建发生在数据库提交前，因此极端崩溃可能留下未注册的工作树。v0.1 保留它而不自动删除，便于手动审查，未实现垃圾回收器。
 

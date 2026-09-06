@@ -63,12 +63,14 @@ async function main(request: RunnerRequest): Promise<RunnerResult> {
   const manager = SessionManager.create(request.workdir, request.sessionDir);
   ({ session } = await createAgentSession({ cwd: request.workdir, agentDir: request.sessionDir, modelRuntime: runtime, model: runtime.getModel('knotrail', request.model.modelId), thinkingLevel: request.model.thinking, noTools: 'builtin', tools: tools.map(tool => tool.name), customTools: tools, resourceLoader: loader, settingsManager: settings, sessionManager: manager }));
   session.agent.toolExecution = 'sequential';
-  let turns = 0, input = 0, output = 0, limitReached = false, modelError: string | undefined;
+  let usageMissing=false;let turns = 0, input = 0, output = 0, limitReached = false, modelError: string | undefined;
   session.subscribe(event => {
     if (event.type === 'turn_start') { if (closed) { session?.agent.abort(); return; } turns++; if (turns > request.maxTurns) { limitReached = true; stop(); return; } send({ kind: 'event', eventKind: 'turn.started', text: 'Model turn started', data: { turn: turns } }); }
     if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') send({ kind: 'event', eventKind: 'assistant.delta', text: event.assistantMessageEvent.delta });
     if (event.type === 'message_end' && event.message.role === 'assistant') {
-      input += event.message.usage.input; output += event.message.usage.output;
+      const usage=event.message.usage;
+      // pi supplies zero defaults when providers omit usage; a zero-total response is not trusted as measured usage.
+      if(Number.isFinite(usage.input)&&Number.isFinite(usage.output)&&usage.input+usage.output>0){input+=usage.input;output+=usage.output;}else usageMissing=true;
       if (event.message.stopReason === 'error') modelError = event.message.errorMessage || 'Model request failed';
     }
     if (event.type === 'turn_end' && turns >= request.maxTurns && !closed) { limitReached = true; stop(); }
@@ -78,6 +80,6 @@ async function main(request: RunnerRequest): Promise<RunnerResult> {
     if (modelError && !aborted && !closed) throw new Error(modelError);
     if (!closed && !aborted) throw new Error('Model ended without submitting a plan or reporting an outcome');
     if (limitReached && !aborted) throw new Error(`Run turn limit reached (${request.maxTurns})`);
-    return { summary: summary || (request.purpose === 'planning' ? 'Plan submitted' : 'Run ended'), turns: Math.min(turns, request.maxTurns), usage: { input, output }, sessionPath: manager.getSessionFile(), aborted };
+    return { summary: summary || (request.purpose === 'planning' ? 'Plan submitted' : 'Run ended'), turns: Math.min(turns, request.maxTurns), usage: input+output>0?{input,output,...(usageMissing||aborted?{partial:true}:{})}:undefined, sessionPath: manager.getSessionFile(), aborted };
   } finally { session.dispose(); }
 }

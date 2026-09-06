@@ -29,9 +29,6 @@ function Tabs<K extends string>({ values, current, set, t }: { values: readonly 
   return <div className="tabs">{values.map(([value, label]) => <button type="button" key={value} aria-pressed={value === current} className="tab" onClick={() => set(value)}>{t(label)}</button>)}</div>;
 }
 function Status({ value, t }: { value: string; t: T }) { return <span className={`status status-${value}`}><span />{t(value as TextKey)}</span>; }
-function BrandMark({ className = '' }: { className?: string }) {
-  return <svg className={`brand-mark ${className}`} viewBox="0 0 28 32" fill="currentColor" aria-hidden="true"><path d="M3 4h4v10.3L17.3 4H23L11 16l13 12h-5.8L7 17.8V28H3z" /></svg>;
-}
 function Empty({ children }: { children: ReactNode }) { return <p className="empty">{children}</p>; }
 function Output({ content, truncated, t }: { content: string; truncated?: boolean; t: T }) {
   return <>{truncated && <p className="warning compact">{t('Truncated')}</p>}<pre>{content}</pre></>;
@@ -185,12 +182,12 @@ export default function App() {
   const chosenNode = snapshot?.plan?.nodes.find(node => node.id === prefs.selectedNode);
 
 
-  if (!boot) return <div className="startup"><BrandMark /><h1>Knotrail</h1>{error ? <><p role="alert">{t(error as TextKey) ?? error}</p><button className="button" onClick={() => window.location.reload()}>{t('Reload')}</button></> : <p>{t('Connecting to the desktop runtime…')}</p>}</div>;
+  if (!boot) return <div className="startup"><h1>Knotrail</h1>{error ? <><p role="alert">{t(error as TextKey) ?? error}</p><button className="button" onClick={() => window.location.reload()}>{t('Reload')}</button></> : <p>{t('Connecting to the desktop runtime…')}</p>}</div>;
   return <div className={`app ${navCollapsed ? 'nav-collapsed' : ''}`}>
     {narrow && !navCollapsed && <button className="navigation-backdrop" aria-label={t('Collapse navigation')} onClick={() => setNavCollapsed(true)} />}
     <aside className="sidebar" ref={sideRef}>
       <div className="sidebar-window-space"><IconButton label={t(navCollapsed ? 'Expand navigation' : 'Collapse navigation')} onClick={() => setNavCollapsed(value => !value)}>{navCollapsed ? <PanelLeftOpen /> : <PanelLeftClose />}</IconButton></div>
-      <div className="brand" role="img" aria-label="Knotrail"><BrandMark /><span className="brand-wordmark nav-copy" aria-hidden="true">notrail</span></div>
+      <div className="brand nav-copy">Knotrail</div>
       <nav aria-label={t('Tasks')}>
         <button className="nav-item" aria-current={page === 'new' ? 'page' : undefined} onClick={() => setPage('new')} title={t('New task')}><SquarePen /><span className="nav-copy">{t('New task')}</span></button>
         <button className="nav-item" onClick={() => { setNavCollapsed(false); setSearchOpen(value => !value); }} title={t('Search tasks')}><Search /><span className="nav-copy">{t('Search tasks')}</span></button>
@@ -254,7 +251,7 @@ export default function App() {
           <Tabs values={[[ 'process', 'Process'], ['steps', 'Steps']]} current={prefs.panelView} set={panelView => updatePrefs({ panelView })} t={t} />
           <div className="plan-scroll"><PlanningPanel snapshot={snapshot} prefs={prefs} updatePrefs={updatePrefs} versionId={planVersion} setVersionId={setPlanVersion} t={t} locale={locale} busy={!!busy} onAnswer={answer} onRetry={async nodeId => { const result = await perform<ImpactPreview>({ type: 'task.previewRetry', taskId: task.id, nodeId, expectedRevision: task.revision }); if (result) setImpact(result); }} /></div>
         </aside>}
-      </div> : selected ? <div className="welcome"><LoaderCircle className="spin" /><p>{t('Working…')}</p></div> : <div className="welcome"><BrandMark className="welcome-mark" /><h2>{t('Choose a project to start')}</h2><p>{t('Open a Git project, describe your goal, and inspect the plan as work progresses.')}</p><button className="button primary" onClick={() => boot.projects.length ? setPage('new') : void addProject()}><Plus />{t(boot.projects.length ? 'New task' : 'Open project')}</button></div>
+      </div> : selected ? <div className="welcome"><LoaderCircle className="spin" /><p>{t('Working…')}</p></div> : <div className="welcome"><h2>{t('Choose a project to start')}</h2><p>{t('Open a Git project, describe your goal, and inspect the plan as work progresses.')}</p><button className="button primary" onClick={() => boot.projects.length ? setPage('new') : void addProject()}><Plus />{t(boot.projects.length ? 'New task' : 'Open project')}</button></div>
         : page === 'new' ? <NewTask projects={boot.projects} selectedProjectId={task?.projectId} busy={!!busy} t={t} onAddProject={addProject} onError={setError} onCreate={async command => { const result = await perform<TaskSnapshot>(command); if (result) { await refresh(); await selectTask(result.task.id); } }} />
         : page === 'settings' ? <SettingsPage settings={boot.settings} capabilities={boot.capabilities} tab={settingsTab} setTab={setSettingsTab} t={t} busy={!!busy} save={saveSettings} onTest={async () => { const result = await perform<{ ok: true; message?: string }>({ type: 'model.check' }); if (result) setNotice(result.message ? t(result.message as TextKey) : t('Available')); }} onSaved={() => setNotice(t('Settings saved'))} />
         : page === 'capabilities' ? <Capabilities t={t} />

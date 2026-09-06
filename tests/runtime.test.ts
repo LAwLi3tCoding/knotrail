@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -7,8 +7,9 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { PiRunner } from '../src/runtime/pi-runner.js';
 import type { RunnerRequest, RunControl, ToolCall } from '../src/runtime/contracts.js';
+import type { PlanDraft } from '../src/shared/contracts.js';
 
-const draft = { sequence: 1, summary: 'Inspect fixture', observations: [{ kind: 'fact', text: 'Fixture exists' }], nodes: [{ id: 'inspect', title: 'Inspect', goal: 'Read fixture', dependsOn: [], kind: 'research', inputs: ['fixture.txt'], outputs: ['report'], checkIds: [] }] };
+const draft: PlanDraft = { sequence: 1, summary: 'Inspect fixture', observations: [{ kind: 'fact', text: 'Fixture exists' }], nodes: [{ id: 'inspect', title: 'Inspect', goal: 'Read fixture', dependsOn: [], kind: 'research', inputs: [{ kind: 'file', path: 'fixture.txt', expect: 'present' }], outputs: [{ id: 'summary', kind: 'text' }], checkIds: [] }] };
 async function fixture(t: { after(fn: () => Promise<void>): void }, responses: { name?: string; args?: unknown; text?: string; error?: boolean }[][], reported?: boolean[]) {
   const root = await mkdtemp(join(tmpdir(), 'knotrail-runtime-')); await mkdir(join(root, 'session'));
   const requests: Record<string, any>[] = [];
@@ -42,10 +43,54 @@ test('real pi SDK streams planning with only read-only tools and closes admissio
   const result = await new PiRunner().run(f.request, { onEvent: (_kind, text) => events.push(text), onTool: async call => { calls.push(call); return { text: 'fixture' }; }, onControl: async control => { controls.push(control); return { text: 'accepted' }; } }, new AbortController().signal);
   assert.equal(result.aborted, false); assert.equal(result.turns, 2); assert.ok(result.sessionPath); assert.ok(result.usage && result.usage.input > 0);
   assert.equal((await readFile(result.sessionPath!, 'utf8')).includes(f.request.model.apiKey!), false);
-  assert.deepEqual(calls.map(call => call.args.path), ['fixture.txt']); assert.equal(controls.length, 1); assert.ok(events.join('').includes('inspect'));
+  assert.deepEqual(calls.map(call => call.args.path), ['fixture.txt']); assert.deepEqual(controls, [{ kind: 'update_plan', draft, submit: true }]); assert.ok(events.join('').includes('inspect'));
   const names = f.requests[0].tools.map((tool: { function: { name: string } }) => tool.function.name).sort();
   assert.deepEqual(names, ['list_files', 'outcome', 'read_file', 'search_files', 'update_plan']);
   for (const tool of f.requests[0].tools) assert.equal(tool.function.parameters.type, 'object');
+});
+test('real pi rejects string declarations before forwarding a typed plan to the coordinator', async t => {
+  const typed: PlanDraft = { ...draft, nodes: [...draft.nodes, { id: 'edit', title: 'Use report', goal: 'Create result from the report', kind: 'edit', dependsOn: ['inspect'], inputs: [{ kind: 'artifact', nodeId: 'inspect', outputId: 'summary' }, { kind: 'file', path: 'new.txt', expect: 'absent' }], outputs: [{ id: 'result', kind: 'file', path: 'new.txt', expect: 'present' }], checkIds: [] }] };
+  const invalid = { ...draft, nodes: [{ ...draft.nodes[0], inputs: ['fixture.txt'], outputs: ['report'] }] };
+  const f = await fixture(t, [[{ name: 'update_plan', args: { draft: invalid, submit: true } }], [{ name: 'update_plan', args: { draft: typed, submit: true } }]]);
+  const controls: RunControl[] = [];
+  const result = await new PiRunner().run(f.request, { onEvent() {}, onTool: async () => ({ text: 'unexpected', isError: true }), onControl: async control => { controls.push(control); return { text: 'accepted' }; } }, new AbortController().signal);
+  assert.equal(result.turns, 2); assert.deepEqual(controls, [{ kind: 'update_plan', draft: typed, submit: true }]);
+  assert.ok(f.requests[1]!.messages.some((message: any) => message.role === 'tool' && /validation|invalid|expected/i.test(message.content)));
+});
+test('real pi research receives bound artifact content and read_input slices without admitting writes or late tools', async t => {
+  const content = 'Bound predecessor report.\nThe omitted section establishes the exact compatibility requirement.';
+  const digest = createHash('sha256').update(content).digest('hex'), end = 25;
+  const input = { ref: { kind: 'artifact', nodeId: 'upstream', outputId: 'summary' }, artifactId: 'artifact-current-attempt', producerRunId: 'run-upstream-2', digest, content: content.slice(0, end), characters: content.length, end, redacted: false };
+  const f = await fixture(t, [[
+    { name: 'write_file', args: { path: 'forbidden.txt', content: 'forbidden', expectedContent: null } },
+    { name: 'edit_file', args: { path: 'forbidden.txt', oldText: 'old', newText: 'new', expectedContent: 'old' } },
+    { name: 'run_command', args: { argv: ['/usr/bin/true'] } },
+    { name: 'read_input', args: { index: 0, offset: end, length: 48000 } },
+  ], [{ name: 'outcome', args: { kind: 'complete', summary: 'Used the bound report' } }, { name: 'read_input', args: { index: 0 } }]]);
+  const calls: ToolCall[] = [], controls: RunControl[] = [];
+  const slice = { index: 0, offset: end, end: content.length, characters: content.length, digest, content: content.slice(end), redacted: false };
+  // This fixture proves Worker delivery through the real SDK, not Core source resolution.
+  const result = await new PiRunner().run({ ...f.request, purpose: 'node', node: { ...draft.nodes[0]!, dependsOn: ['upstream'], inputs: [{ kind: 'artifact', nodeId: 'upstream', outputId: 'summary' }] }, context: JSON.stringify({ inputs: [input] }) }, {
+    onEvent() {}, onTool: async call => { calls.push(call); return { text: JSON.stringify(slice) }; }, onControl: async control => { controls.push(control); return { text: 'accepted' }; },
+  }, new AbortController().signal);
+  assert.equal(result.summary, 'Used the bound report'); assert.equal(result.turns, 2);
+  assert.deepEqual(calls.map(({ name, args }) => ({ name, args })), [{ name: 'read_input', args: { index: 0, offset: end, length: 48000 } }]);
+  assert.deepEqual(controls, [{ kind: 'complete', summary: 'Used the bound report' }]);
+  const message = f.requests[0]!.messages.find((message: any) => message.role === 'user');
+  const prompt = JSON.parse(typeof message.content === 'string' ? message.content : message.content.map((part: any) => part.text ?? '').join(''));
+  assert.deepEqual(JSON.parse(prompt.context).inputs, [input]);
+  assert.equal(JSON.stringify(f.requests[0]!.messages).includes(content.slice(end)), false);
+  assert.deepEqual(f.requests[0]!.tools.map((tool: any) => tool.function.name).sort(), ['list_files', 'outcome', 'read_file', 'read_input', 'search_files']);
+  assert.ok(f.requests[1]!.messages.some((message: any) => message.role === 'tool' && message.content === JSON.stringify(slice)));
+});
+test('real pi read_input validates slice bounds and cannot forward an arbitrary artifact selector', async t => {
+  const invalid = [{ index: -1 }, { index: 0.5 }, { index: 0, offset: -1 }, { index: 0, offset: 0.5 }, { index: 0, length: 0 }, { index: 0, length: 48001 }, { index: 0, length: 1.5 }, { artifactId: 'unbound-old-artifact' }, { index: 0, artifactId: 'unbound-old-artifact' }];
+  const f = await fixture(t, [invalid.map(args => ({ name: 'read_input', args })), [{ name: 'read_input', args: { index: 0, offset: 0, length: 1 } }], [{ name: 'outcome', args: { kind: 'complete', summary: 'Bound read completed' } }]]);
+  const calls: ToolCall[] = [];
+  const result = await new PiRunner().run({ ...f.request, purpose: 'node', node: draft.nodes[0] }, { onEvent() {}, onTool: async call => { calls.push(call); return { text: 'x' }; }, onControl: async () => ({ text: 'accepted' }) }, new AbortController().signal);
+  assert.equal(result.turns, 3);
+  assert.deepEqual(calls.map(({ name, args }) => ({ name, args })), [{ name: 'read_input', args: { index: 0, offset: 0, length: 1 } }]);
+  assert.equal(f.requests[1]!.messages.filter((message: any) => message.role === 'tool').length, invalid.length);
 });
 test('node pi Run routes writes and terminal outcome through parent callbacks', async t => {
   const f = await fixture(t, [[{ name: 'write_file', args: { path: 'new.txt', content: 'ok', expectedContent: null } }], [{ name: 'outcome', args: { kind: 'complete', summary: 'Created file' } }]]);

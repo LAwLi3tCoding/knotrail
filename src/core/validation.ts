@@ -2,11 +2,14 @@ import { z } from 'zod';
 import type { AppCommand, PlanDraft, CheckSpec } from '../shared/contracts.js';
 const text=z.string().min(1).max(32_000), key=z.string().min(1).max(200), revision=z.number().int().positive();
 const path=z.string().min(1).max(4096).refine(p=>!p.startsWith('/')&&!p.split(/[\\/]/).some(s=>s==='..'||s==='.git')&&!p.includes('\0'),'Expected a safe relative path');
+const fileRef=z.object({kind:z.literal('file'),path,expect:z.enum(['present','absent'])}).strict();
+const inputRef=z.union([fileRef,z.object({kind:z.literal('artifact'),nodeId:key,outputId:key}).strict()]);
+const outputSpec=z.union([fileRef.extend({id:key.refine(v=>v!=='summary','summary is reserved for text output')}),z.object({id:z.literal('summary'),kind:z.literal('text')}).strict()]);
 export const checksSchema=z.array(z.object({id:key,label:text,command:z.array(z.string().max(8192)).min(1).max(100),protectedPaths:z.array(path).max(100)}).strict()).max(30).refine(v=>new Set(v.map(x=>x.id)).size===v.length,'Check IDs must be unique');
 export const waitSchema=z.object({kind:z.literal('wait'),reason:text,minutes:z.number().int().min(1).max(43200),source:z.object({kind:z.enum(['workspace_file','project_file']),path}).strict(),condition:z.union([z.object({kind:z.enum(['changed','exists'])}).strict(),z.object({kind:z.literal('contains'),text:z.string().min(1).max(4096)}).strict()])}).strict();
 const secret=z.string().max(8192);
 const prefs=z.object({panelView:z.enum(['process','steps']),selectedNode:key.optional(),detailTab:z.enum(['overview','artifacts','checks','history']),mainView:z.enum(['chat','activity','changes']),toolPanel:z.enum(['files','terminal','preview']).nullable(),graphView:z.enum(['graph','list']),draft:z.string().max(32_000)}).strict();
-const impact=z.object({id:key,taskId:key,expectedRevision:revision,expectedPlanId:key.optional(),workspaceDigest:key,objective:text.optional(),checks:checksSchema.optional(),nodeId:key.optional(),affected:z.array(key),retained:z.array(key),reason:text}).strict();
+const impact=z.object({id:key,taskId:key,expectedRevision:revision,expectedPlanId:key.optional(),workspaceDigest:key,inputSourcesDigest:key.optional(),objective:text.optional(),checks:checksSchema.optional(),nodeId:key.optional(),affected:z.array(key),retained:z.array(key),reason:text}).strict();
 const schemas:Record<string,z.ZodType>={
  'bootstrap':z.object({type:z.literal('bootstrap')}).strict(),
  'project.add':z.object({type:z.literal('project.add'),path:text}).strict(),
@@ -25,11 +28,16 @@ for(const type of ['task.snapshot','task.inspectEffects','task.files','task.expo
 for(const type of ['task.pause','task.resume','task.cancel']) schemas[type]=z.object({type:z.literal(type),taskId:key,expectedRevision:revision}).strict();
 export function parseCommand(input:unknown):AppCommand { const type=(input as {type?:string})?.type; if(!type||!schemas[type]) throw new Error('Unsupported command'); return schemas[type].parse(input) as AppCommand; }
 export function validatePlan(input:unknown, checks:CheckSpec[], committed = true):PlanDraft {
- const value=z.object({sequence:z.number().int().nonnegative(),summary:text,observations:z.array(z.object({kind:z.enum(['fact','constraint','proposal']),text,source:z.string().max(4096).optional()}).strict()).max(100),nodes:z.array(z.object({id:key,title:text,goal:text,dependsOn:z.array(key).max(100),kind:z.enum(['research','edit','verify']),inputs:z.array(z.string().max(4096)).max(100),outputs:z.array(z.string().max(4096)).max(100),checkIds:z.array(key).max(30)}).strict()).min(committed ? 1 : 0).max(60)}).strict().parse(input);
+ const value=z.object({sequence:z.number().int().nonnegative(),summary:text,observations:z.array(z.object({kind:z.enum(['fact','constraint','proposal']),text,source:z.string().max(4096).optional()}).strict()).max(100),nodes:z.array(z.object({id:key,title:text,goal:text,dependsOn:z.array(key).max(100),kind:z.enum(['research','edit','verify']),inputs:z.array(inputRef).max(100),outputs:z.array(outputSpec).min(committed?1:0).max(100),checkIds:z.array(key).max(30)}).strict()).min(committed ? 1 : 0).max(60)}).strict().parse(input);
  const nodes=new Map(value.nodes.map(n=>[n.id,n])); if(nodes.size!==value.nodes.length) throw new Error('Plan node IDs must be unique');
  const visiting=new Set<string>(),done=new Set<string>();
  function visit(nodeId:string) { if(visiting.has(nodeId))throw new Error('Plan dependencies contain a cycle'); if(done.has(nodeId))return; const n=nodes.get(nodeId);if(!n){if(committed)throw new Error('Plan references an unknown dependency');return;}visiting.add(nodeId);n.dependsOn.forEach(visit);visiting.delete(nodeId);done.add(nodeId); }
  value.nodes.forEach(n=>{ visit(n.id); for(const checkId of n.checkIds)if(!checks.some(c=>c.id===checkId))throw new Error('Plan references an unknown check'); });
+ for(const node of value.nodes){
+  if(new Set(node.outputs.map(o=>o.id)).size!==node.outputs.length)throw new Error('Node output IDs must be unique');
+  const ancestors=new Set<string>();function collect(id:string){if(ancestors.has(id))return;ancestors.add(id);nodes.get(id)?.dependsOn.forEach(collect);}node.dependsOn.forEach(collect);
+  for(const ref of node.inputs)if(ref.kind==='artifact'&&committed&&(!ancestors.has(ref.nodeId)||!nodes.get(ref.nodeId)?.outputs.some(o=>o.id===ref.outputId)))throw new Error('Artifact input must reference a declared output of a predecessor');
+ }
  for(const check of checks) if(committed&&!value.nodes.some(n=>n.checkIds.includes(check.id)))throw new Error('Plan must cover every user-defined check');
  return value;
 }

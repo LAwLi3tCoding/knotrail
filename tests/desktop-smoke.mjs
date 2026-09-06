@@ -20,8 +20,9 @@ const objective = 'Replace target.txt with the content of expected.txt, preservi
 const draft = {
   sequence: 1, summary: 'Update the fixture and run the fixed comparison check',
   observations: [{ kind: 'fact', text: 'The fixture currently contains the old value', source: 'target.txt' }],
-  nodes: [{ id: 'edit-fixture', title: 'Update fixture', goal: objective, dependsOn: [], kind: 'edit', inputs: ['target.txt', 'expected.txt'], outputs: ['target.txt'], checkIds: ['compare'] }],
+  nodes: [{ id: 'edit-fixture', title: 'Update fixture', goal: objective, dependsOn: [], kind: 'edit', inputs: [{kind:'file',path:'target.txt',expect:'present'},{kind:'file',path:'expected.txt',expect:'present'}], outputs: [{id:'target',kind:'file',path:'target.txt',expect:'present'}], checkIds: ['compare'] }],
 };
+if (!live) draft.nodes.push({id:'inspect-output',title:'Inspect saved output',goal:'Read the exact output of the edit step',dependsOn:['edit-fixture'],kind:'research',inputs:[{kind:'artifact',nodeId:'edit-fixture',outputId:'target'}],outputs:[{id:'summary',kind:'text'}],checkIds:[]});
 const responses = [
   { name: 'read_file', args: { path: 'target.txt' }, text: 'Inspecting the file before planning.' },
   { name: 'update_plan', args: { draft, submit: true }, text: 'The plan is ready for review.' },
@@ -32,12 +33,13 @@ const responses = [
   { name: 'write_file', args: { path: 'target.txt', content: 'verified result\n', expectedContent: 'before\n' } },
   { name: 'outcome', args: { kind: 'complete', summary: 'Updated target.txt; independent comparison is ready.' } },
 ];
+responses.push({name:'read_input',args:{index:0,offset:0,length:48000}},{name:'outcome',args:{kind:'complete',summary:'Read the saved predecessor output: verified result.'}});
 const acceptanceResponseCount = responses.length;
 const conversationObjective = 'Explain the current value in target.txt.';
 const conversationReply = 'The value in target.txt is before.';
 const conversationDraft = {
   sequence: 1, summary: 'Read the current value and explain it', observations: [],
-  nodes: [{ id: 'answer', title: 'Explain the current value', goal: conversationObjective, dependsOn: [], kind: 'research', inputs: ['target.txt'], outputs: ['Explanation'], checkIds: [] }],
+  nodes: [{ id: 'answer', title: 'Explain the current value', goal: conversationObjective, dependsOn: [], kind: 'research', inputs: [{kind:'file',path:'target.txt',expect:'present'}], outputs: [{id:'summary',kind:'text'}], checkIds: [] }],
 };
 responses.push(
   { name: 'read_file', args: { path: 'target.txt' }, text: 'Inspecting the current value before planning.' },
@@ -170,13 +172,20 @@ try {
   await until('completed');
   assert.equal(await readFile(join(snapshot.task.workdir, 'target.txt'), 'utf8'), 'verified result\n');
   assert.equal(await readFile(join(source, 'target.txt'), 'utf8'), 'before\n');
-  assert.equal(snapshot.runs.length, live ? 2 : 3);
+  assert.equal(snapshot.runs.length, live ? 2 : 4);
   assert.ok(snapshot.checks.length >= 2 && snapshot.checks.every(check => check.result === 'pass'));
   assert.equal(snapshot.nodes[0].status, 'verified');
   assert.ok(snapshot.artifacts.some(artifact => artifact.content.includes('verified result')));
   assert.deepEqual(snapshot.events.map(event => event.seq), Array.from({ length: snapshot.events.length }, (_, index) => index + 1));
   if (!live) {
     assert.equal(requests.length, acceptanceResponseCount);
+    const artifact=snapshot.artifacts.find(a=>a.outputId==='target'),consumer=snapshot.runs.find(r=>r.nodeId==='inspect-output');
+    assert.equal(consumer.inputBindings[0].artifactId,artifact.id);assert.equal(consumer.inputBindings[0].producerRunId,artifact.runId);assert.equal(consumer.inputBindings[0].content,'verified result\n');assert.equal(consumer.inputBindings[0].digest,artifact.digest);
+    const text=requests[8].messages.find(m=>m.role==='user').content;
+    const payload=JSON.parse(Array.isArray(text)?text.map(c=>c.text??'').join(''):text);
+    assert.equal(JSON.parse(payload.context).inputs[0].artifactId,artifact.id);assert.equal(JSON.parse(payload.context).inputs[0].content,'verified result\n');
+    assert.ok(JSON.stringify(requests[9].messages).includes(artifact.id));assert.ok(JSON.stringify(requests[9].messages).includes('verified result'));
+    assert.equal(snapshot.actions.find(a=>a.name==='read_input').status,'succeeded');
     assert.deepEqual(snapshot.actions.filter(action => action.name === 'write_file').map(action => action.status), ['failed', 'succeeded']);
     assert.equal(await readFile(join(snapshot.task.workdir, 'contract.txt'), 'utf8'), 'fixed contract\n');
     assert.ok(snapshot.checks.every(check => check.taskRevision === 2 && check.planId === snapshot.task.activePlanId));
@@ -231,7 +240,7 @@ try {
   }
   assert.deepEqual(errors, [], 'Renderer should not have console or page errors');
   if (process.env.KNOTRAIL_SMOKE_SCREENSHOT) await page.screenshot({ path: process.env.KNOTRAIL_SMOKE_SCREENSHOT });
-  console.log(JSON.stringify({ result: 'passed', packaged: !!process.env.KNOTRAIL_ELECTRON_EXECUTABLE, model: live ? modelId : 'scripted loopback provider through real pi SDK', authSource: live ? 'codex-login' : 'api-key', planningBeforeExecution: true, verifiedChecks: snapshot.checks.length, rightPlanningPanel: true, planTracker: true, languages: ['en', 'zh-CN'], isolatedWorktree: true, encryptedCredentialStorage: true, credentialReadbackRedacted: true, rendererErrors: errors.length, ...(live ? { providerRetries: snapshot.events.filter(event => event.kind === 'provider.retry').length, usage: snapshot.runs.map(run => run.usage) } : { acceptanceRevision: true, revisedProtectionEnforced: true, quickConversation: true, followupContext: true }) }));
+  console.log(JSON.stringify({ result: 'passed', packaged: !!process.env.KNOTRAIL_ELECTRON_EXECUTABLE, model: live ? modelId : 'scripted loopback provider through real pi SDK', authSource: live ? 'codex-login' : 'api-key', planningBeforeExecution: true, verifiedChecks: snapshot.checks.length, rightPlanningPanel: true, planTracker: true, languages: ['en', 'zh-CN'], isolatedWorktree: true, encryptedCredentialStorage: true, credentialReadbackRedacted: true, rendererErrors: errors.length, ...(live ? { providerRetries: snapshot.events.filter(event => event.kind === 'provider.retry').length, usage: snapshot.runs.map(run => run.usage) } : { acceptanceRevision: true, revisedProtectionEnforced: true, quickConversation: true, followupContext: true, predecessorSnapshotConsumed: true }) }));
 } catch (error) {
   console.error(JSON.stringify({ lastStatus: snapshot?.task.status, lastError: snapshot?.task.error, lastEvents: snapshot?.events.slice(-5).map(event => ({ kind: event.kind, text: event.text })), providerRequests: requests.length, hostOutput: live ? undefined : hostOutput, rendererErrors: errors }));
   throw error;

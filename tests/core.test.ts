@@ -1,4 +1,6 @@
 import test from 'node:test';
+import { createHash } from 'node:crypto';
+import { readFileSnapshot } from '../src/core/workspace.js';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, chmodSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,8 +12,8 @@ import { Store, id, now } from '../src/core/store.js';
 import type { Runner, RunnerRequest, RunnerCallbacks } from '../src/runtime/contracts.js';
 import type { Executor } from '../src/execution/contracts.js';
 import { CODEX_BASE_URL } from '../src/shared/contracts.js';
-import type { CheckSpec, Project, TaskSnapshot, ImpactPreview } from '../src/shared/contracts.js';
-const draft={sequence:1,summary:'Update the sample and verify it',observations:[{kind:'fact' as const,text:'Sample repository'}],nodes:[{id:'edit',title:'Edit sample',goal:'Update value',dependsOn:[],kind:'edit' as const,inputs:['sample.txt'],outputs:['sample.txt'],checkIds:['check']},{id:'verify',title:'Review result',goal:'Review current files',dependsOn:['edit'],kind:'verify' as const,inputs:['sample.txt'],outputs:['report'],checkIds:['check']}]};
+import type { CheckSpec, PlanDraft, Project, TaskSnapshot, ImpactPreview } from '../src/shared/contracts.js';
+const draft:PlanDraft={sequence:1,summary:'Update the sample and verify it',observations:[{kind:'fact' as const,text:'Sample repository'}],nodes:[{id:'edit',title:'Edit sample',goal:'Update value',dependsOn:[],kind:'edit' as const,inputs:[{kind:'file',path:'sample.txt',expect:'present'}],outputs:[{id:'sample',kind:'file',path:'sample.txt',expect:'present'}],checkIds:['check']},{id:'verify',title:'Review result',goal:'Review current files',dependsOn:['edit'],kind:'verify' as const,inputs:[{kind:'artifact',nodeId:'edit',outputId:'sample'}],outputs:[{id:'summary',kind:'text'}],checkIds:['check']}]};
 class FixtureRunner implements Runner {
  count=0;pause?:{entered:()=>void;released:Promise<void>};
  async run(r:RunnerRequest,c:RunnerCallbacks,signal:AbortSignal){this.count++;if(r.purpose==='planning'){
@@ -33,7 +35,7 @@ async function setup(t:test.TestContext,runner:Runner=new FixtureRunner()){
 async function until(app:AppService,taskId:string,predicate:(s:TaskSnapshot)=>boolean):Promise<TaskSnapshot>{const deadline=Date.now()+5000;while(Date.now()<deadline){const s=await app.command({type:'task.snapshot',taskId}) as TaskSnapshot;if(predicate(s))return s;await new Promise(r=>setTimeout(r,10));}throw new Error('State did not settle: '+JSON.stringify(await app.command({type:'task.snapshot',taskId})));}
 const create=(project:Project,overrides={})=>({type:'task.create',requestId:id(),projectId:project.id,objective:'Update sample',checks:[{id:'check',label:'Sample check',command:['node','check.mjs'],protectedPaths:['check.mjs']}],executionPolicy:'reviewBeforeExecute',mode:'once',...overrides});
 test('validated plan rejects cycles, unknown dependencies and omitted user checks',()=>{assert.throws(()=>validatePlan({...draft,nodes:[{...draft.nodes[0],dependsOn:['edit']}]},[]),/cycle/);assert.throws(()=>validatePlan({...draft,nodes:[{...draft.nodes[0],dependsOn:['missing']}]},[]),/unknown/);assert.throws(()=>validatePlan({...draft,nodes:[{...draft.nodes[0],checkIds:[]}]},[{id:'check',label:'Required',command:['true'],protectedPaths:[]}]),/every/);});
-test('create is durable/idempotent; ready gate precedes effects; final checks bind digest',async t=>{const {app,project,source}=await setup(t);const command=create(project);const created=await app.command(command) as TaskSnapshot;const duplicate=await app.command(command) as TaskSnapshot;assert.equal(created.task.id,duplicate.task.id);const ready=await until(app,created.task.id,s=>s.task.status==='ready');assert.equal(readFileSync(join(ready.task.workdir,'sample.txt'),'utf8'),'original\n');assert.equal(ready.actions.length,0);await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const done=await until(app,created.task.id,s=>s.task.status==='completed');assert.equal(done.nodes.filter(n=>n.status==='verified').length,2);assert.equal(done.checks.length,3);assert.ok(done.checks.every(c=>c.inputDigest===done.task.acceptedDigest));assert.equal(readFileSync(join(source,'sample.txt'),'utf8'),'original\n');assert.ok(done.artifacts.length===2&&done.artifacts[0]!.content.includes('updated'));assert.deepEqual(done.events.map(e=>e.seq),done.events.map((_,i)=>i+1));assert.ok(app.report(done.task.id).includes('## Event ledger'));});
+test('create is durable/idempotent; ready gate precedes effects; final checks bind digest',async t=>{const {app,project,source}=await setup(t);const command=create(project);const created=await app.command(command) as TaskSnapshot;const duplicate=await app.command(command) as TaskSnapshot;assert.equal(created.task.id,duplicate.task.id);const ready=await until(app,created.task.id,s=>s.task.status==='ready');assert.equal(readFileSync(join(ready.task.workdir,'sample.txt'),'utf8'),'original\n');assert.equal(ready.actions.length,0);await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const done=await until(app,created.task.id,s=>s.task.status==='completed');assert.equal(done.nodes.filter(n=>n.status==='verified').length,2);assert.equal(done.checks.length,3);assert.ok(done.checks.every(c=>c.inputDigest===done.task.acceptedDigest));assert.equal(readFileSync(join(source,'sample.txt'),'utf8'),'original\n');assert.equal(done.artifacts.filter(a=>a.kind==='diff').length,2);assert.equal(done.artifacts.find(a=>a.outputId==='sample')?.content,'updated\n');assert.equal(done.artifacts.find(a=>a.outputId==='summary')?.content,'Finished with evidence');assert.deepEqual(done.events.map(e=>e.seq),done.events.map((_,i)=>i+1));assert.ok(app.report(done.task.id).includes('## Event ledger'));});
 test('no acceptance commands requires explicit user acceptance; stale decisions cannot complete',async t=>{const {app,project}=await setup(t);const created=await app.command(create(project,{checks:[],executionPolicy:'autoWithinGrant'})) as TaskSnapshot;const pending=await until(app,created.task.id,s=>s.task.status==='waiting_user');assert.equal(pending.decisions.length,1);const decision=pending.decisions[0]!;writeFileSync(join(pending.task.workdir,'sample.txt'),'external\n');await assert.rejects(app.command({type:'decision.answer',requestId:id(),taskId:created.task.id,decisionId:decision.id,answer:'accept',expectedRevision:1}),/changed/);});
 test('goal change preserves immutable plans and rejects stale revision; retries invalidate downstream',async t=>{const {app,project}=await setup(t);const created=await app.command(create(project)) as TaskSnapshot;await until(app,created.task.id,s=>s.task.status==='ready');const preview=await app.command({type:'task.previewRetry',taskId:created.task.id,nodeId:'edit',expectedRevision:1}) as ImpactPreview;assert.deepEqual(preview.affected,['edit','verify']);assert.equal(preview.retained.length,0);const changed=await app.command({type:'task.previewRevision',taskId:created.task.id,objective:'Different goal',expectedRevision:1}) as ImpactPreview;await app.command({type:'task.applyImpact',requestId:id(),preview:changed});const ready=await until(app,created.task.id,s=>s.task.status==='ready');assert.equal(ready.task.revision,2);assert.equal(ready.plans.length,2);assert.equal(ready.plans[0]!.taskRevision,1);await assert.rejects(app.command({type:'task.applyImpact',requestId:id(),preview}),/changed/);});
 test('crash recovery marks unfinished effects unknown and blocks automatic replay',async t=>{const {app,project}=await setup(t);const created=await app.command(create(project)) as TaskSnapshot;await until(app,created.task.id,s=>s.task.status==='ready');app.store.update(created.task.id,s=>{s.task.status='executing';s.runs.push({id:id(),taskId:s.task.id,taskRevision:1,purpose:'node',attempt:1,status:'running',startedAt:now(),inputDigest:'digest'});s.actions.push({id:id(),taskId:s.task.id,runId:s.runs.at(-1)!.id,toolCallId:id(),name:'write_file',argsDigest:'digest',status:'pending',startedAt:now()});});
@@ -577,4 +579,226 @@ test('conversation messages cannot convert planned tasks or introduce schedules 
  await assert.rejects(app.command(message), /require a conversation/);
  for (const patch of [{ mode: 'finite', intervalMinutes: 1, expiresAt: new Date(Date.now() + 60000).toISOString() }, { expiresAt: new Date(Date.now() + 60000).toISOString() }, { intervalMinutes: 5 }]) await assert.rejects(app.command(create(project, { interaction: 'conversation', ...patch })), /cannot have a recurring schedule or expiry/);
  for (const patch of [{ text: '   ' }, { turnBudgetStart: 0 }, { expectedRevision: 0 }, { checks: [] }, { status: 'idle' }]) assert.throws(() => parseCommand({ ...message, ...patch }));
+});
+
+test('typed plans require safe declarations and actual predecessor outputs',()=>{
+ assert.equal(validatePlan(draft,[{id:'check',label:'Check',command:['true'],protectedPaths:[]}]).nodes.length,2);
+ for(const mutate of [
+  (p:PlanDraft)=>{p.nodes[0]!.inputs=['sample.txt'];},
+  (p:PlanDraft)=>{p.nodes[0]!.outputs=[];},
+  (p:PlanDraft)=>{p.nodes[0]!.outputs.push(p.nodes[0]!.outputs[0]!);},
+  (p:PlanDraft)=>{p.nodes[0]!.inputs=[{kind:'file',path:'../escape',expect:'present'}];},
+  (p:PlanDraft)=>{p.nodes[1]!.inputs=[{kind:'artifact',nodeId:'edit',outputId:'invented'}];},
+  (p:PlanDraft)=>{p.nodes[1]!.dependsOn=[];},
+ ]){const plan=structuredClone(draft);plan.nodes.forEach(n=>n.checkIds=[]);mutate(plan);assert.throws(()=>validatePlan(plan,[]));}
+});
+test('immutable artifacts carry exact predecessor content across successive overwrites and bounded reads',async t=>{
+ const first='A'.repeat(5100)+'\n',second='second version\n',contexts:any[]=[];
+ const plan:PlanDraft={sequence:1,summary:'Produce and consume two versions',observations:[],nodes:[
+  {id:'a',title:'First',goal:'Create first version',kind:'edit',dependsOn:[],inputs:[{kind:'file',path:'sample.txt',expect:'present'}],outputs:[{id:'file',kind:'file',path:'sample.txt',expect:'present'}],checkIds:[]},
+  {id:'b',title:'Second',goal:'Consume first and overwrite',kind:'edit',dependsOn:['a'],inputs:[{kind:'artifact',nodeId:'a',outputId:'file'}],outputs:[{id:'file',kind:'file',path:'sample.txt',expect:'present'}],checkIds:[]},
+  {id:'c',title:'Compare',goal:'Compare historical versions',kind:'research',dependsOn:['b'],inputs:[{kind:'artifact',nodeId:'a',outputId:'file'},{kind:'artifact',nodeId:'b',outputId:'file'}],outputs:[{id:'summary',kind:'text'}],checkIds:[]},
+ ]};
+ const runner:Runner={async run(r,c,signal){if(r.purpose==='planning')await c.onControl({kind:'update_plan',draft:plan,submit:true});else{
+  const context=JSON.parse(r.context);contexts.push({node:r.node!.id,...context});
+  if(r.node!.id==='a'||r.node!.id==='b')await c.onTool({toolCallId:id(),name:'write_file',args:{path:'sample.txt',content:r.node!.id==='a'?first:second}});
+  if(r.node!.id==='b'){assert.equal(context.inputs[0].content,first.slice(0,4096));assert.equal(context.inputs[0].characters,first.length);const read=await c.onTool({toolCallId:id(),name:'read_input',args:{index:0,offset:4096,length:48000}});assert.equal(read.isError,undefined);assert.equal(read.text.slice(read.text.indexOf('\n')+1),first.slice(4096));}
+  if(r.node!.id==='c'){assert.equal(context.inputs[1].content,second);for(const name of ['write_file','edit_file','run_command'] as const)assert.equal((await c.onTool({toolCallId:id(),name,args:{}})).isError,true);}
+  await c.onControl({kind:'complete',summary:'Compared declared sources'});
+ }return {summary:'done',turns:1,aborted:signal.aborted};}};
+ const {app,project}=await setup(t,runner);const created=await app.command(create(project,{interaction:'conversation',checks:[],executionPolicy:'autoWithinGrant'})) as TaskSnapshot;
+ const done=await until(app,created.task.id,s=>['idle','blocked'].includes(s.task.status));assert.equal(done.task.status,'idle',done.task.error);assert.equal(done.task.acceptedDigest,undefined);
+ const a=done.artifacts.find(a=>a.nodeId==='a'&&a.outputId==='file')!,b=done.artifacts.find(a=>a.nodeId==='b'&&a.outputId==='file')!,consumer=done.runs.find(r=>r.nodeId==='b')!;
+ assert.equal(a.content,first);assert.equal(b.content,second);assert.notEqual(a.digest,b.digest);assert.equal(readFileSync(join(done.task.workdir,'sample.txt'),'utf8'),second);
+ assert.equal(contexts[1].inputs[0].artifactId,a.id);assert.equal(contexts[1].inputs[0].producerRunId,a.runId);assert.equal(contexts[1].inputs[0].digest,a.digest);
+ assert.deepEqual(consumer.inputBindings![0]!.deliveredRanges,[{start:0,end:first.length}]);assert.equal(consumer.inputBindings![0]!.content,first);assert.equal(done.nodes.every(n=>n.status==='finished'),true);
+ assert.equal(done.runs.find(r=>r.nodeId==='c')!.inputBindings![0]!.artifactId,a.id);assert.equal(done.actions.filter(a=>a.nodeId==='c').length,0);
+});
+test('missing file outputs, corrupt artifacts and obsolete producer attempts cannot feed a downstream Run',async t=>{
+ for(const failure of ['missing','corrupt','truncated','old-plan','old-attempt'] as const)await t.test(failure,async t=>{
+  let consumers=0;const plan=structuredClone(draft);plan.nodes.forEach(n=>n.checkIds=[]);if(failure==='missing')plan.nodes[0]!.outputs=[{id:'sample',kind:'file',path:'not-created.txt',expect:'present'}];
+  const runner:Runner={async run(r,c,signal){if(r.purpose==='planning')await c.onControl({kind:'update_plan',draft:plan,submit:true});else{if(r.node!.id==='verify')consumers++;await c.onControl({kind:'complete',summary:'Claimed output'});}return {summary:'done',turns:1,aborted:signal.aborted};}};
+  const {app,project}=await setup(t,runner),put=app.store.put.bind(app.store);let injected=false;
+  app.store.put=s=>{const artifact=s.artifacts.find(a=>a.outputId==='sample');if(artifact&&!injected){injected=true;const producer=s.runs.find(r=>r.id===artifact.runId)!;if(failure==='corrupt')artifact.content='tampered';if(failure==='truncated')artifact.truncated=true;if(failure==='old-plan')producer.planId='previous-plan';if(failure==='old-attempt')s.nodes.find(n=>n.nodeId==='edit')!.attempt++;}put(s);};
+  const created=await app.command(create(project,{interaction:'conversation',checks:[],executionPolicy:'autoWithinGrant'})) as TaskSnapshot;const blocked=await until(app,created.task.id,s=>['blocked','idle'].includes(s.task.status));
+  assert.equal(blocked.task.status,'blocked');assert.equal(consumers,0);assert.equal(blocked.task.acceptedDigest,undefined);assert.equal(blocked.artifacts.some(a=>a.nodeId==='verify'),false);
+  assert.equal(readFileSync(join(blocked.task.workdir,'sample.txt'),'utf8'),'original\n');
+ });
+});
+test('a failed retry preserves historical artifacts but cannot reuse them as current outputs',async t=>{
+ const {app,project}=await setup(t);const created=await app.command(create(project,{interaction:'conversation',checks:[],executionPolicy:'autoWithinGrant'})) as TaskSnapshot;const first=await until(app,created.task.id,s=>s.task.status==='idle');let consumers=0;
+ (app as any).runner={async run(r:RunnerRequest,c:RunnerCallbacks,signal:AbortSignal){if(r.node!.id==='verify')consumers++;await c.onControl({kind:'blocked',reason:'Second attempt could not produce its output'});return {summary:'blocked',turns:1,aborted:signal.aborted};}};
+ const preview=await app.command({type:'task.previewRetry',taskId:created.task.id,nodeId:'edit',expectedRevision:1}) as ImpactPreview;await app.command({type:'task.applyImpact',requestId:id(),preview});const second=await until(app,created.task.id,s=>s.task.status==='blocked');
+ assert.equal(consumers,0);assert.equal(second.nodes[0]!.attempt,2);assert.notEqual(second.nodes[0]!.runId,first.nodes[0]!.runId);assert.equal(second.nodes[1]!.status,'stale');assert.deepEqual(second.artifacts,first.artifacts);assert.equal(second.task.acceptedDigest,undefined);
+});
+
+test('source snapshots distinguish absence and empty UTF-8 files and reject unsafe or incomplete sources',async t=>{
+ const {source}=await setup(t);const absent=readFileSnapshot(source,'empty.txt');assert.equal(absent.source.exists,false);assert.equal(absent.source.sourceDigest,null);
+ writeFileSync(join(source,'empty.txt'),'');const empty=readFileSnapshot(source,'empty.txt');assert.equal(empty.content,'');assert.equal(empty.source.exists,true);assert.equal(empty.source.sourceIdentity,absent.source.sourceIdentity);assert.equal(empty.source.sourceDigest,createHash('sha256').update('').digest('hex'));
+ const text='\uFEFF中文🧩\n';writeFileSync(join(source,'utf8.txt'),text);const utf8=readFileSnapshot(source,'utf8.txt');assert.equal(utf8.content,text);assert.equal(utf8.source.sourceDigest,createHash('sha256').update(Buffer.from(text)).digest('hex'));
+ for(const [path,bytes] of [['binary.txt',Buffer.from([65,0,66])],['invalid.txt',Buffer.from([0xc3,0x28])],['oversized.txt',Buffer.alloc(2*1024*1024+1,65)]] as const){writeFileSync(join(source,path),bytes);assert.throws(()=>readFileSnapshot(source,path));}
+ symlinkSync(join(source,'sample.txt'),join(source,'alias.txt'));assert.throws(()=>readFileSnapshot(source,'alias.txt'),/Symbolic/);assert.throws(()=>readFileSnapshot(source,'../outside'),/outside/);
+ execFileSync('/usr/bin/mkfifo',[join(source,'pipe')]);assert.throws(()=>readFileSnapshot(source,'pipe'),/regular/);
+});
+test('stored output hashes cover redacted content and source hashes retain original byte identity',async t=>{
+ const key='fixture-secret-'+id(),raw='Value '+key+'\n';let delivered:any;
+ const plan=structuredClone(draft);plan.nodes.forEach(n=>n.checkIds=[]);plan.nodes[0]!.outputs.push({id:'summary',kind:'text'});
+ const runner:Runner={async run(r,c,signal){if(r.purpose==='planning')await c.onControl({kind:'update_plan',draft:plan,submit:true});else{if(r.node!.id==='edit')await c.onTool({toolCallId:id(),name:'write_file',args:{path:'sample.txt',content:raw}});else delivered=JSON.parse(r.context).inputs[0];await c.onControl({kind:'complete',summary:raw});}return {summary:raw,turns:1,aborted:signal.aborted};}};
+ const {app,project}=await setup(t,runner);await app.command({type:'settings.save',patch:{model:{apiKey:key}}});const created=await app.command(create(project,{interaction:'conversation',checks:[],executionPolicy:'autoWithinGrant'})) as TaskSnapshot;const done=await until(app,created.task.id,s=>['idle','blocked'].includes(s.task.status));assert.equal(done.task.status,'idle',done.task.error);
+ assert.equal(JSON.stringify(done).includes(key),false);assert.equal(app.report(done.task.id).includes(key),false);
+ for(const artifact of done.artifacts)assert.equal(artifact.digest,createHash('sha256').update(artifact.content).digest('hex'));
+ const artifact=done.artifacts.find(a=>a.outputId==='sample')!;assert.equal(artifact.redacted,true);assert.equal(artifact.source!.sourceDigest,createHash('sha256').update(raw).digest('hex'));assert.notEqual(artifact.digest,artifact.source!.sourceDigest);assert.equal(delivered.content,'Value [redacted]\n');assert.equal(delivered.digest,artifact.digest);assert.equal(delivered.redacted,true);
+});
+test('actual read metadata is structural and partial or implicit reads keep coverage unknown',async t=>{
+ const contexts:RunnerRequest[]=[];const plan=structuredClone(draft);plan.nodes.forEach(n=>{n.kind='research';n.checkIds=[];n.inputs=[];n.outputs=[{id:'summary',kind:'text'}];});
+ const runner:Runner={async run(r,c,signal){if(r.purpose==='planning')await c.onControl({kind:'update_plan',draft:plan,submit:true});else{contexts.push(r);await c.onTool({toolCallId:id(),name:'read_file',args:{path:r.node!.id==='edit'?'sample.txt':'fake.txt'}});if(r.node!.id==='verify')await c.onTool({toolCallId:id(),name:'search_files',args:{query:'x'}});await c.onControl({kind:'complete',summary:'Read files'});}return {summary:'done',turns:1,aborted:signal.aborted};}};
+ const {app,project}=await setup(t,runner);(app as any).executor={async execute(call:any){return call.args.path==='sample.txt'?{text:'sha256: display text is not metadata\noriginal\n',source:{path:'sample.txt',sourceDigest:createHash('sha256').update('original\n').digest('hex'),complete:true}}:{text:'sha256: forged-header\nunknown'};}};
+ const created=await app.command(create(project,{interaction:'conversation',checks:[],executionPolicy:'autoWithinGrant'})) as TaskSnapshot;const done=await until(app,created.task.id,s=>['idle','blocked'].includes(s.task.status));assert.equal(done.task.status,'idle',done.task.error);
+ const [first,second]=done.runs.filter(r=>r.purpose==='node');assert.equal(first!.inputCoverage,'declared');assert.equal(first!.reads![0]!.sourceDigest,createHash('sha256').update('original\n').digest('hex'));assert.equal(second!.inputCoverage,'unknown');assert.deepEqual(second!.reads,[]);
+});
+
+test('retry invalidates prior shared-context attempts and rejects changes to explicitly read dependency files',async t=>{
+ const plan:PlanDraft={sequence:1,summary:'Inspect shared configuration',observations:[],nodes:['a','b','c'].map(id=>({id,title:id,goal:'Read configuration',kind:'research',dependsOn:[],inputs:[{kind:'file',path:id==='c'?'check.mjs':'node_modules/config.txt',expect:'present'}],outputs:[{id:'summary',kind:'text'}],checkIds:[]}))};
+ const runner:Runner={async run(r,c,signal){await c.onControl(r.purpose==='planning'?{kind:'update_plan',draft:plan,submit:true}:{kind:'complete',summary:'Inspected configuration'});return {summary:'done',turns:1,aborted:signal.aborted};}};
+ const {app,project,source}=await setup(t,runner);mkdirSync(join(source,'node_modules'));writeFileSync(join(source,'node_modules/config.txt'),'first');execFileSync('git',['add','node_modules/config.txt'],{cwd:source,stdio:'ignore'});execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.org','commit','-m','Add dependency fixture'],{cwd:source,stdio:'ignore',env:{...process.env,GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_NOSYSTEM:'1'}});
+ const created=await app.command(create(project,{interaction:'conversation',checks:[]})) as TaskSnapshot;const ready=await until(app,created.task.id,s=>s.task.status==='ready');await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const done=await until(app,created.task.id,s=>s.task.status==='idle');
+ writeFileSync(join(ready.task.workdir,'node_modules/config.txt'),'second');const preview=await app.command({type:'task.previewRetry',taskId:created.task.id,nodeId:'a',expectedRevision:1}) as ImpactPreview;assert.deepEqual(preview.affected,['a','b','c']);assert.deepEqual(preview.retained,[]);
+ writeFileSync(join(ready.task.workdir,'node_modules/config.txt'),'third');await assert.rejects(app.command({type:'task.applyImpact',requestId:id(),preview}),/changed/);const paused=await app.command({type:'task.snapshot',taskId:created.task.id}) as TaskSnapshot;assert.equal(paused.task.status,'paused');assert.deepEqual(paused.runs,done.runs);assert.equal(readFileSync(join(paused.task.workdir,'node_modules/config.txt'),'utf8'),'third');
+});
+
+test('declared dependency sources must stay stable through node, final, maintenance and manual acceptance',async t=>{
+ for(const phase of ['node','final','maintenance','manual'] as const)await t.test(phase,async t=>{
+  let checkCount=0,consumers=0;
+  const plan:PlanDraft={sequence:1,summary:'Inspect dependency output',observations:[],nodes:[
+   {id:'produce',title:'Produce',goal:'Produce dependency source',kind:'edit',dependsOn:[],inputs:[],outputs:[{id:'config',kind:'file',path:'node_modules/config.txt',expect:'present'}],checkIds:phase==='manual'?[]:['check']},
+   {id:'consume',title:'Consume',goal:'Read verified output',kind:'research',dependsOn:['produce'],inputs:[{kind:'artifact',nodeId:'produce',outputId:'config'}],outputs:[{id:'summary',kind:'text'}],checkIds:[]},
+  ]};
+  const runner:Runner={async run(r,c,signal){if(r.purpose==='planning')await c.onControl({kind:'update_plan',draft:plan,submit:true});else{if(r.node!.id==='produce'){mkdirSync(join(r.workdir,'node_modules'));writeFileSync(join(r.workdir,'node_modules/config.txt'),'checked');}else consumers++;await c.onControl({kind:'complete',summary:'Done'});}return {summary:'done',turns:1,aborted:signal.aborted};}};
+  const {app,project}=await setup(t,runner);(app as any).executor={async execute(_call:any,options:any){checkCount++;if(checkCount===(phase==='node'?1:phase==='final'?2:3))writeFileSync(join(options.workdir,'node_modules/config.txt'),'changed during check');return {text:'pass',exitCode:0};}};
+  const created=await app.command(create(project,{checks:phase==='manual'?[]:create(project).checks,mode:phase==='maintenance'?'maintain':'once',intervalMinutes:1,executionPolicy:'autoWithinGrant'})) as TaskSnapshot;
+  if(phase==='maintenance'){const healthy=await until(app,created.task.id,s=>s.task.status==='healthy');assert.ok(healthy.task.acceptedSourcesDigest);app.store.update(created.task.id,s=>{s.task.nextCheckAt=new Date(0).toISOString();});(app as any).wake();const unknown=await until(app,created.task.id,s=>s.task.status==='unknown');assert.equal(unknown.task.acceptedDigest,undefined);assert.equal(unknown.task.acceptedSourcesDigest,undefined);assert.equal(unknown.task.health!.status,'unknown');}
+  else if(phase==='manual'){const waiting=await until(app,created.task.id,s=>s.task.status==='waiting_user');assert.ok(waiting.task.acceptedSourcesDigest);writeFileSync(join(waiting.task.workdir,'node_modules/config.txt'),'changed before acceptance');await assert.rejects(app.command({type:'decision.answer',requestId:id(),taskId:created.task.id,expectedRevision:1,decisionId:waiting.decisions[0]!.id,answer:'accept'}),/changed/);assert.equal((await app.command({type:'task.snapshot',taskId:created.task.id}) as TaskSnapshot).task.acceptedSourcesDigest,undefined);}
+  else{const blocked=await until(app,created.task.id,s=>['blocked','completed'].includes(s.task.status));assert.equal(blocked.task.status,'blocked');assert.equal(blocked.task.acceptedDigest,undefined);assert.equal(blocked.task.acceptedSourcesDigest,undefined);assert.equal(blocked.checks.at(-1)!.result,'fail');assert.ok(blocked.checks.at(-1)!.inputSourcesDigest);if(phase==='node'){assert.equal(consumers,0);assert.equal(blocked.artifacts.some(a=>a.outputId==='config'),false);}}
+ });
+});
+test('input and output limits count UTF-8 bytes while read offsets remain UTF-16',async t=>{
+ const {app,source}=await setup(t);writeFileSync(join(source,'data.txt'),'中'.repeat(600000));
+ const s={task:{id:'capacity-fixture',workdir:source}},node={id:'n',title:'Capacity',inputs:Array.from({length:5},()=>({kind:'file',path:'data.txt',expect:'present'})),outputs:Array.from({length:5},(_,i)=>({id:'out'+i,kind:'file',path:'data.txt',expect:'present'}))};
+ assert.throws(()=>(app as any).bindInputs(s,node),/8 MiB/);assert.throws(()=>(app as any).outputArtifacts(s,{id:'r'},node,''),/8 MiB/);
+ const smaller={...node,inputs:node.inputs.slice(0,4),outputs:node.outputs.slice(0,4)};assert.equal((app as any).bindInputs(s,smaller)[0].deliveredRanges[0].end,4096);assert.equal((app as any).outputArtifacts(s,{id:'r'},smaller,'').length,4);
+});
+
+test('planning reads remain bound through publication, Ready and resumed completed nodes',async t=>{
+ for(const phase of ['publication','ready','resume'] as const)await t.test(phase,async t=>{
+  const path='node_modules/planning-source.txt';let planning=0,nodes=0;let workdir='';
+  const plan:PlanDraft={sequence:1,summary:'Use the observed contract',observations:[],nodes:[{id:'answer',title:'Answer',goal:'Report current contract',kind:'research',dependsOn:[],inputs:[],outputs:[{id:'summary',kind:'text'}],checkIds:[]}]};
+  const runner:Runner={async run(r,c,signal){workdir=r.workdir;if(r.purpose==='planning'){planning++;mkdirSync(join(r.workdir,'node_modules'),{recursive:true});if(planning===1)writeFileSync(join(r.workdir,path),'H1');await c.onTool({toolCallId:id(),name:'read_file',args:{path}});await c.onControl({kind:'update_plan',draft:plan,submit:true});if(phase==='publication')writeFileSync(join(r.workdir,path),'changed before publish');}else{nodes++;await c.onControl({kind:'complete',summary:'Observed source'});}return {summary:'done',turns:1,aborted:signal.aborted};}};
+  const {app,project}=await setup(t,runner);(app as any).executor={async execute(call:any,o:any){const content=readFileSync(join(o.workdir,call.args.path),'utf8');return {text:content,source:{path:call.args.path,sourceDigest:createHash('sha256').update(content).digest('hex'),complete:true}};}};
+  const created=await app.command(create(project,{checks:[],interaction:'conversation'})) as TaskSnapshot;
+  if(phase==='publication'){const blocked=await until(app,created.task.id,s=>['blocked','ready'].includes(s.task.status));assert.equal(blocked.task.status,'blocked');assert.equal(blocked.plan,undefined);assert.equal(nodes,0);return;}
+  const ready=await until(app,created.task.id,s=>s.task.status==='ready');assert.equal(ready.plan!.planningRunId,ready.runs[0]!.id);assert.ok(ready.plan!.inputSourcesDigest);
+  if(phase==='ready'){writeFileSync(join(workdir,path),'H2');await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const replanned=await until(app,created.task.id,s=>s.task.status==='ready'&&s.plans.length===2);assert.equal(nodes,0);assert.notEqual(replanned.plan!.planningRunId,ready.plan!.planningRunId);assert.notEqual(replanned.plan!.inputSourcesDigest,ready.plan!.inputSourcesDigest);return;}
+  await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const first=await until(app,created.task.id,s=>s.task.status==='idle');assert.ok(first.nodes[0]!.outputSourcesDigest);await app.command({type:'task.pause',taskId:created.task.id,expectedRevision:1});writeFileSync(join(workdir,path),'H2');await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const second=await until(app,created.task.id,s=>s.task.status==='idle'&&s.runs.length>first.runs.length);assert.equal(nodes,2);assert.equal(second.nodes[0]!.attempt,2);assert.notEqual(second.nodes[0]!.outputSourcesDigest,first.nodes[0]!.outputSourcesDigest);assert.ok(second.events.some(e=>e.kind==='evidence.stale'));assert.deepEqual(second.artifacts.slice(0,first.artifacts.length),first.artifacts);
+ });
+});
+
+test('node premises cannot rebind changed sources between observation, effects and publication',async t=>{
+ for(const phase of ['binding','read','planner','before-effect','publication','declared-edit','other-edit-source'] as const)await t.test(phase,async t=>{
+  const path='node_modules/contract.txt';let checks=0,effects=0,consumers=0,observed='';
+  const editing=['before-effect','declared-edit','other-edit-source'].includes(phase);
+  const plan:PlanDraft={sequence:1,summary:'Use stable current sources',observations:[],nodes:[
+   {id:'produce',title:'Observe',goal:'Report current contract',kind:editing?'edit':'research',dependsOn:[],inputs:phase==='read'||phase==='planner'?[]:[{kind:'file',path,expect:'present'}],outputs:editing?[{id:'summary',kind:'text'},{id:'file',kind:'file',path:phase==='declared-edit'?'./node_modules/contract.txt':'sample.txt',expect:'present'}]:[{id:'summary',kind:'text'}],checkIds:['check']},
+   {id:'consume',title:'Consume',goal:'Use the result',kind:'research',dependsOn:['produce'],inputs:[{kind:'artifact',nodeId:'produce',outputId:'summary'}],outputs:[{id:'summary',kind:'text'}],checkIds:[]}
+  ]};
+  const runner:Runner={async run(r,c,signal){
+   if(r.purpose==='planning'){mkdirSync(join(r.workdir,'node_modules'));writeFileSync(join(r.workdir,path),'H1');if(phase==='planner')await c.onTool({toolCallId:id(),name:'read_file',args:{path}});await c.onControl({kind:'update_plan',draft:plan,submit:true});}
+   else if(r.node!.id==='produce'){
+    observed=JSON.parse(r.context).inputs[0]?.content??'H1';
+    if(phase==='read')await c.onTool({toolCallId:id(),name:'read_file',args:{path}});
+    if(phase!=='publication')writeFileSync(join(r.workdir,path),'H2');
+    if(phase==='before-effect')await c.onTool({toolCallId:id(),name:'write_file',args:{path:'sample.txt',content:'must not run'}});
+    await c.onControl({kind:'complete',summary:'Current contract is '+(phase==='declared-edit'?'H2':observed)});
+   }else{consumers++;await c.onControl({kind:'complete',summary:JSON.parse(r.context).inputs[0].content});}
+   return {summary:'done',turns:1,aborted:signal.aborted};
+  }};
+  const {app,project}=await setup(t,runner);(app as any).executor={async execute(call:any,o:any){
+   if(call.name==='read_file'){const content=readFileSync(join(o.workdir,call.args.path),'utf8');return {text:content,source:{path:call.args.path,sourceDigest:createHash('sha256').update(content).digest('hex'),complete:true}};}
+   if(call.name==='write_file'){effects++;writeFileSync(join(o.workdir,call.args.path),call.args.content);}else checks++;return {text:'pass',exitCode:0};
+  }};
+  if(phase==='publication'){const collect=(app as any).outputArtifacts.bind(app);(app as any).outputArtifacts=(s:TaskSnapshot,...args:any[])=>{const outputs=collect(s,...args);writeFileSync(join(s.task.workdir,path),'H2');return outputs;};}
+  const created=await app.command(create(project,{executionPolicy:'autoWithinGrant'})) as TaskSnapshot,done=await until(app,created.task.id,s=>['completed','blocked'].includes(s.task.status));
+  const run=done.runs.find(r=>r.nodeId==='produce')!;assert.equal(observed,'H1');assert.equal(readFileSync(join(done.task.workdir,path),'utf8'),'H2');assert.equal(effects,0);
+  if(phase!=='read')assert.equal(run.sourcePremises!.find(source=>source.path===path)!.sourceDigest,createHash('sha256').update('H1').digest('hex'));
+  else assert.equal(run.reads![0]!.sourceDigest,createHash('sha256').update('H1').digest('hex'));
+  if(phase==='declared-edit'){assert.equal(done.task.status,'completed',done.task.error);assert.equal(consumers,1);assert.ok(done.task.acceptedDigest);assert.equal(done.artifacts.find(a=>a.outputId==='file')!.content,'H2');}
+  else{assert.equal(done.task.status,'blocked');assert.equal(consumers,0);assert.equal(done.task.acceptedDigest,undefined);assert.equal(done.artifacts.some(a=>a.outputId),false);assert.equal(checks,phase==='publication'?1:0);assert.equal(readFileSync(join(done.task.workdir,'sample.txt'),'utf8'),'original\n');}
+ });
+});
+
+test('node handoffs preserve the completed source state before downstream work or final acceptance',async t=>{
+ for(const phase of ['next','final','manual'] as const)for(const path of ['sample.txt','node_modules/contract.txt'])await t.test(phase+': '+path,async t=>{
+  let changed=false,consumers=0,checks=0;const plan:PlanDraft={sequence:1,summary:'Report current contract',observations:[],nodes:[{id:'observe',title:'Observe',goal:'Read the contract',kind:'research',dependsOn:[],inputs:[{kind:'file',path,expect:'present'}],outputs:[{id:'summary',kind:'text'}],checkIds:phase==='manual'?[]:['check']}]};
+  if(phase==='next')plan.nodes.push({id:'consume',title:'Consume',goal:'Use the result',kind:'edit',dependsOn:['observe'],inputs:[{kind:'artifact',nodeId:'observe',outputId:'summary'}],outputs:[{id:'file',kind:'file',path,expect:'present'}],checkIds:[]});
+  const runner:Runner={async run(r,c,signal){if(r.purpose==='planning'){if(path.startsWith('node_modules')){mkdirSync(join(r.workdir,'node_modules'));writeFileSync(join(r.workdir,path),'H1');}await c.onControl({kind:'update_plan',draft:plan,submit:true});}else{if(r.node!.id==='consume')consumers++;await c.onControl({kind:'complete',summary:JSON.parse(r.context).inputs[0].content});}return {summary:'done',turns:1,aborted:signal.aborted};}};
+  const {app,project}=await setup(t,runner);(app as any).executor={async execute(){checks++;return {text:'pass',exitCode:0};}};
+  (app as any).options.notify=({taskId}:any)=>{if(!taskId||changed)return;const s=app.store.get(taskId);if(s.events.at(-1)?.kind==='node.finished'){changed=true;writeFileSync(join(s.task.workdir,path),'H2');}};
+  const created=await app.command(create(project,{checks:phase==='manual'?[]:create(project).checks,executionPolicy:'autoWithinGrant'})) as TaskSnapshot,done=await until(app,created.task.id,s=>['blocked','completed','waiting_user'].includes(s.task.status));
+  assert.equal(changed,true);assert.equal(done.task.status,'blocked');assert.equal(done.task.acceptedDigest,undefined);assert.equal(done.task.acceptedSourcesDigest,undefined);assert.equal(done.decisions.length,0);assert.equal(consumers,0);assert.equal(checks,phase==='manual'?0:1);assert.equal(done.checks.some(c=>c.scope==='final'),false);assert.equal(done.nodes.every(n=>n.status==='stale'),true);
+  assert.equal(done.artifacts.find(a=>a.outputId==='summary')!.content,path==='sample.txt'?'original\n':'H1');assert.equal(readFileSync(join(done.task.workdir,path),'utf8'),'H2');assert.ok(done.events.some(e=>e.kind==='evidence.stale'));
+ });
+});
+
+test('decision and external-wait Runs cannot hide changed upstream sources on continuation',async t=>{
+ for(const mode of ['decision','wait'] as const)for(const scenario of ['ordinary-change','ignored-change','unchanged-new-read'] as const)await t.test(mode+': '+scenario,async t=>{
+  const path=scenario==='ordinary-change'?'sample.txt':'node_modules/contract.txt';let interrupted=false,consumers=0;
+  const plan:PlanDraft={sequence:1,summary:'Inspect then format',observations:[],nodes:[
+   {id:'inspect',title:'Inspect',goal:'Report contract',kind:'research',dependsOn:[],inputs:[{kind:'file',path,expect:'present'}],outputs:[{id:'summary',kind:'text'}],checkIds:[]},
+   {id:'format',title:'Format',goal:'Format report',kind:'research',dependsOn:['inspect'],inputs:[{kind:'artifact',nodeId:'inspect',outputId:'summary'}],outputs:[{id:'summary',kind:'text'}],checkIds:['check']}
+  ]};
+  const runner:Runner={async run(r,c,signal){
+   if(r.purpose==='planning'){mkdirSync(join(r.workdir,'node_modules'));writeFileSync(join(r.workdir,'node_modules/contract.txt'),'H1');writeFileSync(join(r.workdir,'node_modules/extra.txt'),'extra');await c.onControl({kind:'update_plan',draft:plan,submit:true});}
+   else if(r.node!.id==='inspect')await c.onControl({kind:'complete',summary:JSON.parse(r.context).inputs[0].content});
+   else if(!interrupted){interrupted=true;if(scenario==='unchanged-new-read')await c.onTool({toolCallId:id(),name:'read_file',args:{path:'node_modules/extra.txt'}});await c.onControl(mode==='decision'?{kind:'decision',question:'Choose report format',options:['short','long']}:{kind:'wait',reason:'Await report format',minutes:1,source:{kind:'project_file',path:'signal.txt'},condition:{kind:'exists'}});}
+   else{consumers++;await c.onControl({kind:'complete',summary:JSON.parse(r.context).inputs[0].content});}
+   return {summary:'done',turns:1,aborted:signal.aborted};
+  }};
+  const {app,project,source}=await setup(t,runner);(app as any).executor={async execute(call:any,o:any){if(call.name==='read_file'){const snapshot=readFileSnapshot(o.workdir,call.args.path);return {text:snapshot.content,source:{path:call.args.path,sourceDigest:snapshot.source.sourceDigest,complete:true}};}return {text:'pass',exitCode:0};}};
+  const created=await app.command(create(project,{mode:mode==='wait'?'finite':'once',intervalMinutes:1,expiresAt:mode==='wait'?new Date(Date.now()+600000).toISOString():undefined,executionPolicy:'autoWithinGrant'})) as TaskSnapshot;
+  const waiting=await until(app,created.task.id,s=>s.task.status===(mode==='decision'?'waiting_user':'waiting_external'));
+  if(scenario!=='unchanged-new-read')writeFileSync(join(waiting.task.workdir,path),'H2');
+  if(mode==='decision')await app.command({type:'decision.answer',requestId:id(),taskId:created.task.id,expectedRevision:1,decisionId:waiting.decisions.find(d=>d.kind==='model')!.id,answer:'short'});
+  else{writeFileSync(join(source,'signal.txt'),'ready');app.store.update(created.task.id,s=>{s.task.nextCheckAt=new Date(0).toISOString();});(app as any).wake();}
+  const done=await until(app,created.task.id,s=>['completed','blocked'].includes(s.task.status));
+  if(scenario==='unchanged-new-read'){assert.equal(done.task.status,'completed',done.task.error);assert.equal(consumers,1);assert.ok(done.task.acceptedDigest);assert.equal(done.nodes[0]!.attempt,1);}
+  else{assert.equal(done.task.status,'blocked');assert.equal(consumers,0);assert.equal(done.task.acceptedDigest,undefined);assert.equal(done.nodes.every(n=>n.status==='stale'),true);assert.equal(done.checks.length,0);assert.deepEqual(done.artifacts,waiting.artifacts);assert.equal(readFileSync(join(done.task.workdir,path),'utf8'),'H2');}
+ });
+});
+
+test('declared writes survive decisions and waits only while their suspended state stays current',async t=>{
+ for(const mode of ['decision','wait'] as const)for(const change of ['none','input','output'] as const)await t.test(mode+': '+change,async t=>{
+  const output='node_modules/output.txt';let edits=0,writes=0;
+  const plan:PlanDraft={sequence:1,summary:'Inspect, edit, then choose format',observations:[],nodes:[
+   {id:'inspect',title:'Inspect',goal:'Read input',kind:'research',dependsOn:[],inputs:[{kind:'file',path:'sample.txt',expect:'present'}],outputs:[{id:'summary',kind:'text'}],checkIds:[]},
+   {id:'edit',title:'Edit',goal:'Write output',kind:'edit',dependsOn:['inspect'],inputs:[{kind:'artifact',nodeId:'inspect',outputId:'summary'}],outputs:[{id:'file',kind:'file',path:output,expect:'present'}],checkIds:['check']}
+  ]};
+  const runner:Runner={async run(r,c,signal){if(r.purpose==='planning')await c.onControl({kind:'update_plan',draft:plan,submit:true});else if(r.node!.id==='inspect')await c.onControl({kind:'complete',summary:JSON.parse(r.context).inputs[0].content});else if(++edits===1){await c.onTool({toolCallId:id(),name:'write_file',args:{path:output,content:'draft',expectedContent:null}});await c.onControl(mode==='decision'?{kind:'decision',question:'Choose format',options:['short','long']}:{kind:'wait',reason:'Await format',minutes:1,source:{kind:'project_file',path:'signal.txt'},condition:{kind:'exists'}});}else await c.onControl({kind:'complete',summary:'Formatted output'});return {summary:'done',turns:1,aborted:signal.aborted};}};
+  const {app,project,source}=await setup(t,runner);(app as any).executor={async execute(call:any,o:any){if(call.name==='write_file'){writes++;mkdirSync(join(o.workdir,'node_modules'),{recursive:true});writeFileSync(join(o.workdir,call.args.path),call.args.content);}return {text:'pass',exitCode:0};}};
+  const created=await app.command(create(project,{mode:mode==='wait'?'finite':'once',intervalMinutes:1,expiresAt:mode==='wait'?new Date(Date.now()+600000).toISOString():undefined,executionPolicy:'autoWithinGrant'})) as TaskSnapshot;
+  const waiting=await until(app,created.task.id,s=>s.task.status===(mode==='decision'?'waiting_user':'waiting_external'));assert.ok(waiting.runs.at(-1)!.suspendedState);assert.equal(waiting.actions[0]!.status,'succeeded');
+  if(change!=='none')writeFileSync(join(waiting.task.workdir,change==='input'?'sample.txt':output),'external');
+  if(mode==='decision')await app.command({type:'decision.answer',requestId:id(),taskId:created.task.id,expectedRevision:1,decisionId:waiting.decisions[0]!.id,answer:'short'});else{writeFileSync(join(source,'signal.txt'),'ready');due(app,created.task.id);}
+  const done=await until(app,created.task.id,s=>['completed','blocked'].includes(s.task.status));assert.equal(writes,1);
+  if(change==='none'){assert.equal(done.task.status,'completed',done.task.error);assert.equal(edits,2);assert.equal(done.nodes[0]!.attempt,1);assert.equal(done.artifacts.find(a=>a.outputId==='file')!.content,'draft');}
+  else{assert.equal(done.task.status,'blocked');assert.equal(edits,1);assert.equal(done.task.acceptedDigest,undefined);assert.equal(done.nodes.every(n=>n.status==='stale'),true);assert.deepEqual(done.artifacts,waiting.artifacts);assert.equal(readFileSync(join(done.task.workdir,change==='input'?'sample.txt':output),'utf8'),'external');}
+ });
+});
+
+test('a declared workspace-file wait re-evaluates nodes on its new observed source',async t=>{
+ let waited=false;const plan:PlanDraft={sequence:1,summary:'Report changed sample',observations:[],nodes:[{id:'observe',title:'Observe',goal:'Report the next sample',kind:'research',dependsOn:[],inputs:[{kind:'file',path:'sample.txt',expect:'present'}],outputs:[{id:'summary',kind:'text'}],checkIds:['check']}]};
+ const runner:Runner={async run(r,c,signal){if(r.purpose==='planning')await c.onControl({kind:'update_plan',draft:plan,submit:true});else if(!waited){waited=true;await c.onControl({kind:'wait',reason:'Await the next sample',minutes:1,source:{kind:'workspace_file',path:'sample.txt'},condition:{kind:'changed'}});}else await c.onControl({kind:'complete',summary:JSON.parse(r.context).inputs[0].content});return {summary:'done',turns:1,aborted:signal.aborted};}};
+ const {app,project}=await setup(t,runner);(app as any).executor={async execute(_call:any,o:any){const ok=readFileSync(join(o.workdir,'sample.txt'),'utf8')==='external result\n';return {text:ok?'pass':'fail',exitCode:ok?0:1,isError:!ok};}};
+ const created=await app.command(create(project,{objective:'Report changed sample',mode:'finite',intervalMinutes:1,expiresAt:new Date(Date.now()+600000).toISOString(),executionPolicy:'autoWithinGrant'})) as TaskSnapshot;
+ const waiting=await until(app,created.task.id,s=>s.task.status==='waiting_external');assert.ok(waiting.runs.at(-1)!.suspendedState);
+ writeFileSync(join(waiting.task.workdir,'sample.txt'),'external result\n');due(app,created.task.id);
+ const done=await until(app,created.task.id,s=>['completed','blocked'].includes(s.task.status));assert.equal(done.task.status,'completed',done.task.error);assert.equal(done.nodes[0]!.attempt,2);assert.equal(done.runs.at(-1)!.inputBindings![0]!.content,'external result\n');assert.ok(done.events.some(e=>e.kind==='evidence.stale'));assert.ok(done.task.acceptedDigest);assert.equal(done.artifacts.find(a=>a.outputId==='summary')!.content,'external result\n');assert.equal(readFileSync(join(done.task.workdir,'sample.txt'),'utf8'),'external result\n');
 });

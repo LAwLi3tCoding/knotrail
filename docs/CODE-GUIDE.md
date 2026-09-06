@@ -137,7 +137,8 @@ Worker 使用已固定版本的 `@earendil-works/pi-coding-agent`。项目和全
 
 | 工具 | 关键参数 | 语义 |
 | --- | --- | --- |
-| `read_file` | path | 返回文本与 SHA-256；大文本截断 |
+| `read_file` | path | 返回文本及结构化 source.path/sourceDigest/complete；大文本截断 |
+| `read_input` | index、offset/length 可选 | 仅节点 Run，读取本次固定输入的 UTF-16 片段，length 为 1—48,000 |
 | `list_files` | path 可选 | 受范围限制的列表，最多 2,000 项 |
 | `search_files` | query、path 可选 | 有界搜索，最多 200 个匹配 |
 | `write_file` | path、content、expectedContent 或 expectedHash | 新文件用 expectedContent:null；旧文件必须匹配当前内容或 hash |
@@ -162,7 +163,21 @@ Worker 使用已固定版本的 `@earendil-works/pi-coding-agent`。项目和全
 
 `waitSchema` 独立校验 1—43,200 的整数分钟间隔、安全相对路径和严格字段。source 仅支持 workspace_file / project_file；condition 为 changed、exists 或带非空文本的 contains。once 拒绝 wait，不能用控制结果把单次任务升级为持续任务。
 
-用户的 `CheckSpec.command` 与工具参数不同：它在 Core 中转换为 `run_command.args.argv`。固定检查不经过模型改写。`check()` 为整批验收创建唯一 batchId，冻结 taskRevision、planId、checksDigest、inputDigest。存在已消费等待时另存 observationDigest。每条 CheckReceipt 保存这些绑定及 node/final/maintenance scope。`batchMatches()` 核对绑定和来源当前内容，`batchCurrent()` 还要求该批通过；检查前后及节点/任务落状态时复核，变化会阻止成功，即使命令 exit code 为零。acceptedDigest 不重新读取一个未验证的摘要。
+用户的 `CheckSpec.command` 与工具参数不同：它在 Core 中转换为 `run_command.args.argv`。固定检查不经过模型改写。`check()` 为整批验收创建唯一 batchId，冻结 taskRevision、planId、checksDigest、inputDigest 和 inputSourcesDigest。`knownSources()` 覆盖声明文件及本版节点读取及 plan.planningRunId 指向的规划读取，包括 workspaceDigest 忽略的依赖目录；不可采集时 complete=false，批次不得通过。存在已消费等待时另存 observationDigest。每条 CheckReceipt 保存这些绑定及 node/final/maintenance scope。`batchMatches()` 核对绑定和来源当前内容，`batchCurrent()` 还要求该批通过；检查前后及节点/任务落状态时复核，变化会阻止成功，即使命令 exit code 为零。acceptedDigest 与 acceptedSourcesDigest 使用同一有效批次，人工接受也重新核对已知来源，不能用检查后才采集的 H2 代替检查 H1 的证据。
+
+### 输入、输出与交付记录
+
+`InputRef` 使用 file/path/expect 或 artifact/nodeId/outputId；`OutputSpec` 使用文件 id/path/expect 或 `{id:"summary",kind:"text"}`。`validatePlan()` 接受不完整草稿，但正式提交要求每个节点有输出，产物引用必须指向依赖祖先的声明输出。历史 PlanNode 保留字符串联合类型用于读取，不允许把旧声明作为新计划提交。
+
+`bindInputs()` 通过 NodeState.runId/attempt 找当前生产者，核对 Run 的 TaskRevision/Plan/status，要求目标 outputId 恰好有一份未截断且内容摘要有效的 Artifact。它不会搜索上次成功尝试。PlanRevision 另存 planningRunId/inputSourcesDigest，避免 Planning Run 的旧 planId 使本次实际读取失去来源归属；发布前回读原始 sourceDigest，Ready 后首次执行核对已知来源。节点完成保存 outputSourcesDigest，reconcile 使用最近实际完成 Run 对应的节点来源及 acceptedSourcesDigest 使外部变化失效。`readFileSnapshot()` 使用有界 fd 读取、NOFOLLOW/NONBLOCK、前后 stat 和路径复核；缺失文件返回显式 exists:false，其他不完整来源抛错。绑定记录及本次 NodeState 在 Run 准入事务保存，工具尚未执行。
+
+`context.inputs` 提供 index、ref、来源、artifactId、producerRunId、digest、content 预览、characters 和 range。`readInput()` 只按当前 Run 的整数索引访问保存快照，不接受任意 artifactId；通过 `executeRecorded()` 共用动作回执。成功返回后合并 deliveredRanges，不为未交付片段补全范围。初始预览范围表示 Core 提交给运行器的内容，不是网络接收回执。pi 的 Integer 转换会截断分数，Worker 因此使用 Number + multipleOf:1，Core 再以 Number.isInteger 校验。
+
+`outputArtifacts()` 收集声明文件和摘要；文件的 sourceDigest 哈希原始字节，Artifact.digest 哈希实际保存的脱敏文本。旧无 outputId 的记录仅显示“已记录产物哈希”，不追溯假设其采集方式。`complete` 分支重新检查来源、验收批次、Task/Plan/Run/attempt，再将声明产物与节点成功状态一起保存。失败保留真实文件和历史记录，不发布可消费的旧产物替身。
+
+`Run.sourcePremises` 保存准入时的已知文件状态；`assertObservedInputs()` 在节点工具准入、complete 进入 check 前和产物发布事务中核对它、直接文件绑定和本次实际读取。对这些已知或实际读取来源，仅 edit/verify 声明的文件输出可变化，路径通过 safePath 规范化后比较。这不是完整写入白名单；未观察文件与命令隐含写入仍未全面追踪。artifact 输入仍使用保存的快照，不与当前文件比较。不能把检查开始时新采集的来源替代该 Run 已依赖的来源。`continuationCurrent()` 在后继 Run 准入事务和 final 检查建批时核对最近完成节点的 outputDigest/outputSourcesDigest；变化由 `invalidateSources()` 撤销当前资格，保留历史。该检查选取当前最近的完成节点或具有 suspendedState 的正常中断 Run。决定/等待收尾先调用 assertObservedInputs 核对非可变前提，再保存合法写入后的 workspaceDigest/sourcesDigest，并复查采集稳定性；因此正常写入不被误判为外部修改，中断期间的输入或输出变化仍会阻止旧产物消费。knownSources 使用截至所选 Run 的读取集合；显式失效时 NodeState.reason 撤销中断记录的继续资格，新 Run 准入会清除旧 reason。reconcile 复用此判定。workspace_file 等待的新观察若改变工作区，observeWait 先使旧节点失效，再按新输入运行；project_file 仍单独受 observation 约束，不能放过无关的工作区变化。维护复验不继承旧节点的完成前提。
+
+`Run.reads` 只采用 helper 的结构化 source，不解析输出里的 sha256 文本。Core 若进一步截断或脱敏，complete 会变为 false。`inputCoverage=declared` 只说明已跟踪声明及当前可记录的读取；列表、搜索、命令和不完整读取使其变为 unknown。当前提示仍包含全任务历史，重试保守撤销已有尝试的完成资格，未实现语义研究复用。
 
 ## 6. 持久化和恢复
 
@@ -176,7 +191,7 @@ Worker 使用已固定版本的 `@earendil-works/pi-coding-agent`。项目和全
 
 acceptance、model、recovery 使用显式 kind 分派，模型不能用问题文本伪装成宿主验收。当前恢复仍依赖用户查证；没有从 diff 推断命令未发生，也没有通用 exactly-once 保证。
 
-`task.previewRevision` 与 `ImpactPreview` 的 checks 使用相同 CheckSpec 校验：最多 30 项、ID 唯一、argv 为字符串数组、保护路径不得越界。省略字段与空数组含义不同；维护任务拒绝空检查。`dispatch()` 的 `task.applyImpact` 分支校验数据库中签发的完整预览，并重新核对 TaskRevision、Plan 和工作区摘要。确认后同时更新 Task.checks 与 revisionHistory，清除当前完成资格和旧待答决定，重新进入 planning；新 Planner 不能遗漏用户检查。
+`task.previewRevision` 与 `ImpactPreview` 的 checks 使用相同 CheckSpec 校验：最多 30 项、ID 唯一、argv 为字符串数组、保护路径不得越界。省略字段与空数组含义不同；维护任务拒绝空检查。`dispatch()` 的 `task.applyImpact` 分支校验数据库中签发的完整预览，并重新核对 TaskRevision、Plan、工作区摘要及 inputSourcesDigest。后者覆盖声明文件和本版实际读取，包含工作区摘要忽略的依赖目录；来源不可读取时记录不可用状态，执行绑定仍须成功。确认后同时更新 Task.checks 与 revisionHistory，清除当前完成资格和旧待答决定，重新进入 planning；新 Planner 不能遗漏用户检查。
 
 该事务将任务快照、impact.applied 原始预览、一次性预览消费及 requestId 一起保存。回归通过真实 SQLite 触发器使最后的请求记录写入失败，确认此前任务和预览更新均回滚，再以同一请求成功继续。这是受控事务故障，不能替代磁盘满或真实 I/O 故障实验。`report()` 的 Task revisions 段保存完整历史检查定义，回执仍绑定原任务版本与检查定义摘要。
 

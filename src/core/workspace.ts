@@ -1,8 +1,9 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { constants, existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync, openSync, readFileSync, readdirSync, realpathSync, closeSync, writeFileSync, chmodSync } from 'node:fs';
+import { constants, existsSync, lstatSync, fstatSync, readSync, mkdirSync, mkdtempSync, rmSync, openSync, readFileSync, readdirSync, realpathSync, closeSync, writeFileSync, chmodSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
+import type { FileSource } from '../shared/contracts.js';
 export const digest = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 // These commands never checkout, run hooks, execute diff drivers, or invoke repository filters.
 export function git(cwd: string, args: string[]): Buffer {
@@ -48,6 +49,24 @@ export function files(root: string): string[] {
 }
 export function workspaceDigest(root: string): string { const h=createHash('sha256'); for(const path of files(root)) { h.update(path+'\0'); h.update(readFileSync(safePath(root,path))); h.update('\0'+(lstatSync(join(root,path)).mode&0o777)); } return h.digest('hex'); }
 export function readText(root: string, path: string): {content:string;truncated:boolean} { const target=safePath(root,path); const stat=lstatSync(target); if(!stat.isFile()) throw new Error('Expected a regular file'); const fd=openSync(target,constants.O_RDONLY|constants.O_NOFOLLOW); try { const bytes=readFileSync(fd); if(bytes.subarray(0,8192).includes(0)) throw new Error('Binary preview is unavailable'); return {content:bytes.subarray(0,256_000).toString('utf8'),truncated:bytes.length>256_000}; } finally {closeSync(fd);} }
+// A binding is a complete, bounded snapshot; previews must never stand in for one.
+export function readFileSnapshot(root:string,path:string):{source:FileSource;content:string} {
+  const canonical=realpathSync(root),base=lstatSync(canonical),target=safePath(canonical,path,false),normalized=relative(canonical,target);
+  const sourceIdentity=digest(JSON.stringify([canonical,base.dev,base.ino,normalized]));let fd:number;
+  try {fd=openSync(target,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);}
+  catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;safePath(canonical,path,false);return {source:{path:normalized,exists:false,sourceDigest:null,sourceIdentity},content:''};}
+  try {
+    const before=fstatSync(fd),limit=2*1024*1024;
+    if(!before.isFile()||before.size>limit)throw new Error('Input/output snapshots require regular UTF-8 files no larger than 2 MiB');
+    const buffer=Buffer.alloc(limit+1);let size=0,count=0;
+    do {count=readSync(fd,buffer,size,buffer.length-size,null);size+=count;}while(count&&size<buffer.length);
+    const after=fstatSync(fd),current=lstatSync(safePath(canonical,path));
+    if(size>limit||size!==before.size||after.size!==size||after.mtimeMs!==before.mtimeMs||after.ctimeMs!==before.ctimeMs||current.dev!==before.dev||current.ino!==before.ino||current.ctimeMs!==after.ctimeMs)throw new Error('Input/output source changed during snapshot');
+    const bytes=buffer.subarray(0,size);if(bytes.includes(0))throw new Error('Binary input/output snapshots are unsupported');
+    const content=new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(bytes);
+    return {source:{path:normalized,exists:true,sourceDigest:digest(bytes),sourceIdentity,mode:after.mode&0o777},content};
+  } finally {closeSync(fd);}
+}
 function tree(root: string): {mode:string;oid:string;path:string}[] {
   return git(root,['ls-tree','-rz','--full-tree','HEAD']).toString().split('\0').filter(Boolean).map(entry=>{
     const tab=entry.indexOf('\t'),[mode,type,oid]=entry.slice(0,tab).split(' '),path=entry.slice(tab+1);

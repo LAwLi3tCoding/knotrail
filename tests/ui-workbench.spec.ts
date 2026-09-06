@@ -1,5 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { resolve, dirname } from 'node:path';
 import type { AppCommand, Bootstrap, ImpactPreview, TaskSnapshot } from '../src/shared/contracts';
 
@@ -8,6 +9,7 @@ import type { AppCommand, Bootstrap, ImpactPreview, TaskSnapshot } from '../src/
 const appDirectory = dirname(resolve(process.env.KNOTRAIL_UI_PATH ?? 'dist/renderer/index.html'));
 const appUrl = 'https://knotrail.test/index.html';
 const now = '2026-09-06T09:00:00.000Z';
+// String declarations intentionally represent historical plans; new-plan validation is tested in Core.
 const fixture: TaskSnapshot = {
   task: { id: 'task-1', projectId: 'project-1', title: 'Upgrade the adapter', objective: 'Upgrade the adapter and preserve the public API.', mode: 'once', status: 'executing', revision: 1, activePlanId: 'plan-1', workdir: 'worktree', baseline: 'abc123def456', createdAt: now, updatedAt: now, executionPolicy: 'autoWithinGrant', checks: [{ id: 'test', label: 'API tests', command: ['npm', 'test'], protectedPaths: ['test/api.test.ts'] }], maxTurns: 40, maxRunMs: 900000, turnCount: 3, revisionHistory: [{ revision: 1, objective: 'Upgrade the adapter and preserve the public API.', checks: [], createdAt: now }] },
   plan: { id: 'plan-1', taskRevision: 1, revision: 1, sequence: 1, summary: 'Inspect callers, adapt the implementation, and verify compatibility.', observations: [{ kind: 'fact', text: 'Three callers depend on the adapter.', source: 'src/adapter.ts' }], nodes: [
@@ -134,6 +136,40 @@ async function finishConversationRound(page: Page, response: string) {
     state.change({ task: { ...s.task, status: 'idle', activePlanId: plan.id, turnCount: s.task.turnCount + 2 }, plan, plans: [...s.plans, plan], nodes: [{ nodeId: 'respond', status: 'finished', attempt: 1, runId }], runs: [...s.runs, { id: runId, taskId: s.task.id, taskRevision: revision, planId: plan.id, nodeId: 'respond', purpose: 'node', attempt: 1, status: 'succeeded', summary: response, inputDigest: 'conversation-input', startedAt: s.task.updatedAt, endedAt: s.task.updatedAt }], events: [...s.events, { id: `response-${revision}`, seq: s.lastSequence + 1, taskId: s.task.id, taskRevision: revision, planId: plan.id, nodeId: 'respond', runId, kind: 'assistant.response', text: response, createdAt: s.task.updatedAt }] });
   }, response);
   await expect(page.locator('.titlebar .status')).toHaveText('Ready for next message');
+}
+
+async function showInputEvidence(page: Page) {
+  await start(page);
+  const hash = (text: string) => createHash('sha256').update(text).digest('hex');
+  const plans = [1, 2].map(revision => ({ ...fixture.plan!, id: `typed-plan-${revision}`, revision, taskRevision: revision, nodes: [
+    { id: 'research', title: 'Capture the inventory', goal: 'Record a stable caller inventory.', kind: 'research' as const, dependsOn: [], inputs: [{ kind: 'file' as const, path: `docs/input-v${revision}.txt`, expect: 'present' as const }], outputs: [{ id: 'inventory', kind: 'file' as const, path: 'build/inventory.json', expect: 'present' as const }, { id: 'summary' as const, kind: 'text' as const }], checkIds: [] },
+    { id: 'edit', title: 'Use the fixed inventory', goal: 'Use the recorded upstream output.', kind: 'edit' as const, dependsOn: ['research'], inputs: [{ kind: 'artifact' as const, nodeId: 'research', outputId: 'inventory' }, { kind: 'file' as const, path: `config-v${revision}.json`, expect: 'present' as const }, { kind: 'file' as const, path: 'obsolete.json', expect: 'absent' as const }, { kind: 'file' as const, path: 'private-settings.txt', expect: 'present' as const }, { kind: 'file' as const, path: 'empty.txt', expect: 'present' as const }], outputs: [{ id: 'adapter', kind: 'file' as const, path: 'src/adapter.ts', expect: 'present' as const }, { id: 'summary' as const, kind: 'text' as const }], checkIds: [] },
+  ] }));
+  const artifacts: TaskSnapshot['artifacts'] = ['before', 'current'].map(version => {
+    const content = version === 'before' ? 'Original caller inventory from the earlier run.' : 'Revised caller inventory from the current run.';
+    return { id: `inventory-${version}`, taskId: 'task-1', nodeId: 'research', runId: `producer-${version}`, outputId: 'inventory', kind: 'file', name: 'build/inventory.json', content, truncated: false, redacted: false, digest: hash(content), source: { path: 'build/inventory.json', exists: true, sourceDigest: hash(content), sourceIdentity: `inventory-source-${version}`, mode: 0o644 }, createdAt: now };
+  });
+  const outputContent = 'export const adapter = "recorded";';
+  artifacts.push({ id: 'adapter-current', taskId: 'task-1', nodeId: 'edit', runId: 'consumer-current', outputId: 'adapter', kind: 'file', name: 'src/adapter.ts', content: outputContent, truncated: false, redacted: false, digest: hash(outputContent), source: { path: 'src/adapter.ts', exists: true, sourceDigest: hash(outputContent), sourceIdentity: 'adapter-source-current', mode: 0o644 }, createdAt: now });
+  const runs: TaskSnapshot['runs'] = ['before', 'current'].flatMap((version, index) => {
+    const artifact = artifacts[index]!, revision = index + 1, config = `Configuration version ${revision}.`, redacted = 'setting=[REDACTED]';
+    const base = { taskId: 'task-1', taskRevision: revision, planId: plans[index]!.id, purpose: 'node' as const, attempt: 1, startedAt: now, inputDigest: `run-input-${version}` };
+    return [
+      { ...base, id: `producer-${version}`, nodeId: 'research', status: 'succeeded' as const, endedAt: now, summary: artifact.content, inputCoverage: 'declared' as const, inputBindings: [], reads: [] },
+      { ...base, id: `consumer-${version}`, nodeId: 'edit', status: version === 'current' ? 'running' as const : 'succeeded' as const, inputCoverage: 'unknown' as const, inputBindings: [
+        { ref: { kind: 'artifact' as const, nodeId: 'research', outputId: 'inventory' }, artifactId: artifact.id, producerRunId: artifact.runId, source: artifact.source, digest: artifact.digest, content: artifact.content, redacted: false, deliveredRanges: [{ start: 0, end: 10 }, { start: 10, end: artifact.content.length }] },
+        { ref: { kind: 'file' as const, path: `config-v${revision}.json`, expect: 'present' as const }, source: { path: `config-v${revision}.json`, exists: true, sourceDigest: hash(config), sourceIdentity: `config-source-${version}` }, digest: hash(config), content: config, redacted: false, deliveredRanges: [{ start: 0, end: 3 }, { start: 7, end: config.length }] },
+        { ref: { kind: 'file' as const, path: 'obsolete.json', expect: 'absent' as const }, source: { path: 'obsolete.json', exists: false, sourceDigest: null, sourceIdentity: 'missing-source' }, digest: hash(''), content: '', redacted: false, deliveredRanges: [] },
+        { ref: { kind: 'file' as const, path: 'private-settings.txt', expect: 'present' as const }, source: { path: 'private-settings.txt', exists: true, sourceDigest: hash('setting=original omitted value'), sourceIdentity: 'redacted-source' }, digest: hash(redacted), content: redacted, redacted: true, deliveredRanges: [{ start: 0, end: redacted.length }] },
+        { ref: { kind: 'file' as const, path: 'empty.txt', expect: 'present' as const }, source: { path: 'empty.txt', exists: true, sourceDigest: hash(''), sourceIdentity: 'empty-source' }, digest: hash(''), content: '', redacted: false, deliveredRanges: [] },
+      ], reads: [{ path: `config-v${revision}.json`, sourceDigest: hash(config), complete: false }, { path: 'build/inventory.json', sourceDigest: artifact.source!.sourceDigest!, complete: true }] },
+    ];
+  });
+  await page.evaluate(({ plans, artifacts, runs }) => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, interaction: 'conversation', revision: 2, activePlanId: plans[1]!.id, status: 'executing', checks: [] }, plan: plans[1], plans, artifacts, runs, nodes: [{ nodeId: 'research', status: 'finished', attempt: 1, runId: 'producer-current' }, { nodeId: 'edit', status: 'running', attempt: 1, runId: 'consumer-current' }], checks: [], actions: [] });
+  }, { plans, artifacts, runs });
+  await expect(page.locator('.plan-tracker [data-node-id="research"] .step-progress')).toHaveText('Finished');
 }
 
 async function delayRevisionResponses(page: Page, commandType: 'task.previewRevision' | 'task.applyImpact' | 'task.message' | 'task.create' = 'task.previewRevision') {
@@ -1274,6 +1310,147 @@ test('task steps stream canonical progress and recorded inputs and outputs with 
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(360);
   expect(await tracker.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
   await page.screenshot({ path: test.info().outputPath('step-records-360-zh.png') });
+});
+
+test('typed declarations and fixed upstream inputs show output IDs, producer runs and recorded hashes', async ({ page }) => {
+  await showInputEvidence(page);
+  const step = page.locator('.plan-tracker [data-node-id="edit"]');
+  await step.locator(':scope > summary').click();
+  const declarations = step.locator('.tracker-detail > dl');
+  await expect(declarations).toContainText('research / inventory');
+  await expect(declarations).toContainText('config-v2.json');
+  await expect(declarations).toContainText('Must be absent');
+  await expect(declarations).toContainText('adapter');
+  await expect(declarations).toContainText('Text summary');
+  await expect(page.locator('.app')).not.toContainText('[object Object]');
+  const run = step.locator('[data-run-id="consumer-current"]'), binding = run.locator('[data-input-index="0"]');
+  await expect(binding).not.toHaveAttribute('open', '');
+  await expect(binding.locator('pre')).not.toBeVisible();
+  await expect(binding.locator(':scope > summary')).toContainText('All saved content delivered');
+  await binding.locator(':scope > summary').click();
+  await expect(binding).toContainText('inventory-current');
+  await expect(binding).toContainText('producer-current');
+  await expect(binding).toContainText('inventory-source-current');
+  await expect(binding).toContainText('0o644');
+  const artifact = await page.evaluate(() => (window as unknown as { uiTest: { snapshot: TaskSnapshot } }).uiTest.snapshot.artifacts.find(artifact => artifact.id === 'inventory-current')!);
+  await expect(binding.locator('.io-metadata')).toContainText(artifact.digest);
+  await expect(binding.locator('.io-metadata')).toContainText(artifact.source!.sourceDigest!);
+  await binding.locator('.saved-input-content > summary').click();
+  await expect(binding.locator('pre')).toHaveText('Revised caller inventory from the current run.');
+  const output = run.locator('[data-artifact-id="adapter-current"]');
+  await output.locator(':scope > summary').click();
+  await expect(output).toContainText('Output ID');
+  await expect(output).toContainText('adapter-source-current');
+  await expect(output).toContainText('consumer-current');
+  await expect(output.locator('pre')).toHaveText('export const adapter = "recorded";');
+  await page.getByRole('button', { name: 'Planning', exact: true }).click();
+  const panel = page.getByRole('complementary', { name: 'Planning', exact: true });
+  await panel.getByRole('button', { name: 'Steps', exact: true }).click();
+  await panel.getByRole('button', { name: /Use the fixed inventory.*Current|Use the fixed inventory.*Running/ }).click();
+  await expect(panel.locator('.detail-content > dl')).toContainText('research / inventory');
+  await expect(panel.locator('.detail-content > dl')).toContainText('src/adapter.ts');
+  await expect(panel).not.toContainText('[object Object]');
+  await expect(page.locator('.plan-tracker .section-heading')).toContainText('1 / 2 Finished steps · 0 Verified');
+});
+
+test('same-ID historical runs retain their own fixed input content, producing runs and declarations', async ({ page }) => {
+  await showInputEvidence(page);
+  const step = page.locator('.plan-tracker [data-node-id="edit"]');
+  await step.locator(':scope > summary').click();
+  await step.locator('.step-history > summary').click();
+  const earlier = step.locator('[data-run-id="consumer-before"]');
+  await earlier.locator(':scope > summary').click();
+  await earlier.locator('.run-declarations > summary').click();
+  await expect(earlier.locator('.run-declarations')).toContainText('config-v1.json');
+  await expect(earlier.locator('.run-declarations')).not.toContainText('config-v2.json');
+  const oldInput = earlier.locator('[data-input-index="0"]');
+  await oldInput.locator(':scope > summary').click();
+  await oldInput.locator('.saved-input-content > summary').click();
+  await expect(oldInput).toContainText('producer-before');
+  await expect(oldInput).toContainText('inventory-before');
+  await expect(oldInput.locator('pre')).toHaveText('Original caller inventory from the earlier run.');
+  await expect(earlier).not.toContainText('producer-current');
+  await expect(earlier).not.toContainText('Revised caller inventory');
+  const currentInput = step.locator('[data-run-id="consumer-current"] [data-input-index="0"]');
+  await currentInput.locator(':scope > summary').click();
+  await currentInput.locator('.saved-input-content > summary').click();
+  await expect(currentInput.locator('pre')).toHaveText('Revised caller inventory from the current run.');
+  await expect(currentInput).not.toContainText('producer-before');
+});
+
+test('input evidence distinguishes delivery gaps, redaction, known absence, empty files and unknown read coverage', async ({ page }) => {
+  await showInputEvidence(page);
+  const step = page.locator('.plan-tracker [data-node-id="edit"]');
+  await step.locator(':scope > summary').click();
+  const run = step.locator('[data-run-id="consumer-current"]');
+  await expect(run.locator('.input-coverage')).toHaveText('Input coverage: Unknown');
+  await expect(run).toContainText('Input coverage is unknown; additional reads may not be recorded.');
+  const partial = run.locator('[data-input-index="1"]');
+  await expect(partial.locator(':scope > summary')).toContainText('Partly delivered');
+  await partial.locator(':scope > summary').click();
+  await expect(partial).toContainText('[0, 3)');
+  await expect(partial).toContainText('[7, 24)');
+  await expect(partial).toContainText('Ranges record content supplied to the runner, not provider receipt or model comprehension.');
+  await expect(partial).not.toContainText('All saved content delivered');
+  const missing = run.locator('[data-input-index="2"]');
+  await missing.locator(':scope > summary').click();
+  await expect(missing).toContainText('Known missing file');
+  await expect(missing).toContainText('Must be absent');
+  await expect(missing).toContainText('File missing');
+  await expect(missing).not.toContainText('All saved content delivered');
+  const redacted = run.locator('[data-input-index="3"]');
+  await redacted.locator(':scope > summary').click();
+  await expect(redacted.locator(':scope > summary')).toContainText('All saved redacted content delivered');
+  await expect(redacted).toContainText('not the original bytes');
+  const binding = await page.evaluate(() => (window as unknown as { uiTest: { snapshot: TaskSnapshot } }).uiTest.snapshot.runs.find(run => run.id === 'consumer-current')!.inputBindings![3]!);
+  expect(binding.digest).not.toBe(binding.source!.sourceDigest);
+  await expect(redacted).toContainText(binding.digest);
+  await expect(redacted).toContainText(binding.source!.sourceDigest!);
+  const empty = run.locator('[data-input-index="4"]');
+  await empty.locator(':scope > summary').click();
+  await expect(empty).toContainText('Empty saved content');
+  await expect(empty).toContainText('File exists');
+  await expect(empty).not.toContainText('File missing');
+  await run.locator('.file-reads > summary').click();
+  await expect(run.locator('.file-reads')).toContainText('Partial read');
+  await expect(run.locator('.file-reads')).toContainText('Read in full');
+  await page.getByRole('combobox', { name: 'Language', exact: true }).selectOption('zh-CN');
+  await expect(run).toContainText('输入覆盖范围未知');
+  await expect(redacted).toContainText('已交付全部已保存的脱敏内容');
+  await expect(partial).toContainText('范围记录交给运行器的内容，不代表服务商已收到或模型已理解。');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator('.sidebar').getByRole('button', { name: '收起导航', exact: true }).click();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  expect(await step.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await page.screenshot({ path: test.info().outputPath('input-evidence-zh-narrow.png') });
+});
+
+test('legacy string declarations and truncated artifacts preserve unknown input evidence and conservative hashes', async ({ page }) => {
+  await start(page);
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ artifacts: state.snapshot.artifacts.map(artifact => ({ ...artifact, truncated: true, redacted: true })) });
+  });
+  const step = page.locator('.plan-tracker [data-node-id="edit"]');
+  await step.locator(':scope > summary').click();
+  await expect(step.locator('.tracker-detail > dl')).toContainText('Caller inventory');
+  const run = step.locator('[data-run-id="run-2"]');
+  await expect(run.locator('.input-coverage')).toHaveText('Input coverage: Unknown');
+  await expect(run).toContainText('Fixed inputs were not recorded for this run.');
+  await run.locator('.file-reads > summary').click();
+  await expect(run.locator('.file-reads')).toContainText('File reads were not recorded for this run.');
+  const artifact = run.locator('[data-artifact-id="artifact-1"]');
+  await expect(artifact.locator(':scope > summary')).toContainText('Redacted');
+  await expect(artifact.locator(':scope > summary')).toContainText('Truncated');
+  await artifact.locator(':scope > summary').click();
+  await expect(artifact).toContainText('Recorded artifact hash');
+  await expect(artifact).not.toContainText('Saved content hash (SHA-256)');
+  await expect(artifact).toContainText('Not recorded');
+  await expect(artifact).toContainText('Saved content is redacted; it does not reproduce the original bytes.');
+  await page.locator('.tool-toggles').getByRole('button', { name: 'Preview', exact: true }).click();
+  await expect(page.locator('.artifact-preview')).toContainText('Recorded artifact hash');
+  await expect(page.locator('.artifact-preview')).toContainText('Truncated');
+  await expect(page.locator('.artifact-preview')).not.toContainText('Saved content hash (SHA-256)');
 });
 
 test('retry and plan revision preserve history without treating prior same-ID outputs as current', async ({ page }) => {

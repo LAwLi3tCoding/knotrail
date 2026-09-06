@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { lookup } from 'node:dns/promises';
 import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
@@ -181,4 +182,11 @@ test('close-entry EPERM keeps execution pending while a same-group background de
   assert.equal(submitted, true);
   const stopped = await readFile(join(f.workdir, 'background.txt'), 'utf8'); await delay(100);
   assert.equal(await readFile(join(f.workdir, 'background.txt'), 'utf8'), stopped);
+});
+
+test('sandbox read metadata hashes original UTF-8 bytes and never reports a truncated source complete', {skip:!capability.sandbox},async t=>{
+ const f=await fixture(t),content='\uFEFF中文🧩\n';await writeFile(join(f.workdir,'utf8.txt'),content);
+ const full=await f.run('read_file',{path:'utf8.txt'});assert.equal(full.isError,undefined);assert.deepEqual(full.source,{path:'utf8.txt',sourceDigest:createHash('sha256').update(Buffer.from(content)).digest('hex'),complete:true});assert.ok(full.text.endsWith(content));
+ const long='a'.repeat(70000);await writeFile(join(f.workdir,'long.txt'),long);const partial=await f.run('read_file',{path:'long.txt'});assert.equal(partial.truncated,true);assert.equal(partial.source!.complete,false);assert.equal(partial.source!.sourceDigest,createHash('sha256').update(long).digest('hex'));
+ await writeFile(join(f.workdir,'invalid.txt'),Buffer.from([0xc3,0x28]));const invalid=await f.run('read_file',{path:'invalid.txt'});assert.equal(invalid.isError,true);assert.equal(invalid.source,undefined);
 });

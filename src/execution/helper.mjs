@@ -31,13 +31,16 @@ async function checkedPath(input = '.', write = false) {
 }
 async function currentFile(path) {
   try {
-    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
     try {
       const stat = await handle.stat();
       if (!stat.isFile() || stat.size > MAX_FILE) throw new Error('Expected a regular text file no larger than 2 MiB');
-      const buffer = await handle.readFile();
-      if (buffer.includes(0)) throw new Error('Binary files are not supported');
-      return buffer.toString('utf8');
+      const buffer = Buffer.alloc(stat.size + 1);let size=0,count=0;
+      do {({bytesRead:count}=await handle.read(buffer,size,buffer.length-size,null));size+=count;}while(count&&size<buffer.length);
+      const after=await handle.stat();
+      if(size!==stat.size||after.size!==size||after.mtimeMs!==stat.mtimeMs||after.ctimeMs!==stat.ctimeMs)throw new Error('File changed during read');
+      if (buffer.subarray(0,size).includes(0)) throw new Error('Binary files are not supported');
+      return new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(buffer.subarray(0,size));
     } finally { await handle.close(); }
   } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
@@ -98,7 +101,8 @@ async function execute(call) {
   const path = await checkedPath(args.path ?? '.', call.name === 'write_file' || call.name === 'edit_file');
   if (call.name === 'read_file') {
     const value = await currentFile(path); if (value === null) throw new Error('File does not exist');
-    return bounded(`sha256: ${hash(value)}\n${value}`);
+    const text=`sha256: ${hash(value)}\n${value}`;
+    return bounded(text,{source:{path:relative(request.workdir,path),sourceDigest:hash(value),complete:text.length<=LIMIT}});
   }
   if (call.name === 'list_files') return bounded((await files(path)).map(path => relative(request.workdir, path)).join('\n'));
   if (call.name === 'search_files') {

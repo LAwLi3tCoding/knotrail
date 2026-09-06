@@ -450,3 +450,131 @@ test('acceptance revision input rejects absent changes, duplicate IDs, unsafe pa
  for (const checks of [[check, check], [{ ...check, command: 'node check.mjs' }], [{ ...check, protectedPaths: ['../outside'] }], [{ ...check, command: [42] }], [{ ...check, injected: true }]]) assert.throws(() => parseCommand({ ...command, checks }));
  assert.deepEqual(parseCommand({ ...command, checks: [] }), { ...command, checks: [] });
 });
+
+test('conversations keep one worktree and ordered message history without claiming unchecked acceptance', async t => {
+ const requests: RunnerRequest[] = [], fixture = new FixtureRunner();
+ const runner: Runner = { async run(request, callbacks, signal) { requests.push(request); return fixture.run(request, callbacks, signal); } };
+ const { app, project, dataDir, source } = await setup(t, runner);
+ const initial = await app.command(create(project, { interaction: 'conversation', checks: [], executionPolicy: 'autoWithinGrant', maxTurns: 3 })) as TaskSnapshot;
+ const first = await until(app, initial.task.id, s => s.task.status === 'idle');
+ assert.equal(first.task.acceptedDigest, undefined);
+ assert.equal(first.decisions.length, 0);
+ assert.ok(first.nodes.every(node => node.status === 'finished'));
+ assert.equal(first.task.turnCount, 3);
+ const retry = await app.command({ type: 'task.previewRetry', taskId: first.task.id, expectedRevision: 1, nodeId: 'edit' }) as ImpactPreview;
+ await app.command({ type: 'task.applyImpact', requestId: id(), preview: retry });
+ const exhausted = await until(app, first.task.id, s => s.task.status === 'blocked');
+ assert.match(exhausted.task.error!, /budget/);
+ assert.equal(exhausted.task.turnCount, 3);
+ assert.equal(exhausted.task.turnBudgetStart, undefined);
+ const message = { type: 'task.message', requestId: id(), taskId: first.task.id, expectedRevision: 1, text: 'Explain the value you just changed without changing the acceptance checks.' };
+ await app.command(message);
+ const second = await until(app, first.task.id, s => s.task.status === 'idle' && s.task.revision === 2);
+ assert.equal(second.task.id, first.task.id);
+ assert.equal(second.task.workdir, first.task.workdir);
+ assert.equal(second.task.title, first.task.title);
+ assert.equal(second.task.turnCount, 6);
+ assert.equal(second.task.turnBudgetStart, 3);
+ assert.deepEqual(second.plans[0], first.plan);
+ assert.deepEqual(second.artifacts.slice(0, first.artifacts.length), first.artifacts);
+ assert.equal(second.task.acceptedDigest, undefined);
+ assert.equal(second.decisions.length, 0);
+ assert.equal(second.events.filter(e => e.kind === 'user.message').length, 1);
+ assert.equal(second.events.filter(e => e.kind === 'assistant.response').length, 4);
+ const history = JSON.parse(requests[3]!.context).conversation;
+ assert.deepEqual(history.messages.map((m: { role: string }) => m.role), ['user', 'assistant', 'assistant', 'user']);
+ assert.equal(history.messages[0].text, initial.task.objective);
+ assert.equal(history.messages.at(-1).text, message.text);
+ assert.equal(history.messages[1].text, 'Finished with evidence');
+ assert.equal(history.omittedMessages, 0);
+ assert.equal(requests[3]!.purpose, 'planning');
+ assert.equal(requests[3]!.maxTurns, 3);
+ assert.equal((await app.command(message) as TaskSnapshot).task.revision, 2);
+ assert.equal(fixture.count, 6);
+ assert.equal(readFileSync(join(source, 'sample.txt'), 'utf8'), 'original\n');
+ assert.match(app.report(first.task.id), /Explain the value you just changed/);
+ await app.shutdown();
+ const reopened = new Store(dataDir);
+ try { assert.deepEqual(reopened.get(first.task.id), second); } finally { reopened.close(); }
+});
+
+test('conversation checks and review policy stay binding, and the same thread can continue after a stop', async t => {
+ const { app, project } = await setup(t);
+ const initial = await app.command(create(project, { interaction: 'conversation' })) as TaskSnapshot;
+ const ready = await until(app, initial.task.id, s => s.task.status === 'ready');
+ assert.equal(ready.actions.length, 0);
+ await app.command({ type: 'task.resume', taskId: initial.task.id, expectedRevision: 1 });
+ const first = await until(app, initial.task.id, s => s.task.status === 'idle');
+ assert.equal(first.checks.length, 3);
+ assert.ok(first.nodes.every(node => node.status === 'verified'));
+ assert.ok(first.task.acceptedDigest);
+ await app.command({ type: 'task.cancel', taskId: initial.task.id, expectedRevision: 1 });
+ await app.command({ type: 'task.message', requestId: id(), taskId: initial.task.id, expectedRevision: 1, text: 'Continue in this workspace with the same fixed conditions.' });
+ const next = await until(app, initial.task.id, s => s.task.status === 'ready' && s.task.revision === 2);
+ assert.deepEqual(next.task.checks, first.task.checks);
+ assert.equal(next.task.acceptedDigest, undefined);
+ assert.equal(next.actions.length, first.actions.length);
+ assert.equal(next.task.executionPolicy, 'reviewBeforeExecute');
+ (app as any).executor = { async execute() { return { text: 'Required check failed', isError: true, exitCode: 1 }; } };
+ await app.command({ type: 'task.resume', taskId: initial.task.id, expectedRevision: 2 });
+ const blocked = await until(app, initial.task.id, s => ['idle', 'blocked'].includes(s.task.status));
+ assert.equal(blocked.task.status, 'blocked');
+ assert.equal(blocked.task.acceptedDigest, undefined);
+});
+
+test('a new conversation message stops the old run before replanning and refuses late effects', async t => {
+ let entered!: () => void, delayed = false, lateDenied = false;
+ const running = new Promise<void>(resolve => { entered = resolve; }), fixture = new FixtureRunner();
+ const runner: Runner = { async run(request, callbacks, signal) {
+  if (request.purpose === 'node' && !delayed) {
+   delayed = true; entered();
+   await new Promise<void>(resolve => { if (signal.aborted) resolve(); else signal.addEventListener('abort', () => resolve(), { once: true }); });
+   lateDenied = !!(await callbacks.onTool({ toolCallId: id(), name: 'write_file', args: { path: 'late.txt', content: 'obsolete' } })).isError;
+   return { summary: 'Stopped old turn', turns: 1, aborted: true };
+  }
+  return fixture.run(request, callbacks, signal);
+ } };
+ const { app, project } = await setup(t, runner);
+ const initial = await app.command(create(project, { interaction: 'conversation', checks: [], executionPolicy: 'autoWithinGrant' })) as TaskSnapshot;
+ await running;
+ await app.command({ type: 'task.message', requestId: id(), taskId: initial.task.id, expectedRevision: 1, text: 'Use the updated request.' });
+ const done = await until(app, initial.task.id, s => s.task.status === 'idle');
+ assert.equal(lateDenied, true);
+ assert.equal(done.task.revision, 2);
+ assert.equal(done.runs[1]!.status, 'aborted');
+ assert.equal(done.runs[2]!.purpose, 'planning');
+ assert.equal(done.actions.some(action => action.output?.includes('obsolete')), false);
+ assert.throws(() => readFileSync(join(done.task.workdir, 'late.txt')), { code: 'ENOENT' });
+});
+
+test('conversation message acceptance is atomic, rejects stale requests and cannot bypass unknown effects', async t => {
+ const { app, project } = await setup(t);
+ const initial = await app.command(create(project, { interaction: 'conversation', checks: [] })) as TaskSnapshot;
+ const before = await until(app, initial.task.id, s => s.task.status === 'ready');
+ const message = { type: 'task.message', requestId: 'conversation-atomic', taskId: initial.task.id, expectedRevision: 1, text: 'The next user message' };
+ app.store.db.exec("CREATE TEMP TRIGGER reject_message BEFORE INSERT ON requests WHEN NEW.id = 'conversation-atomic' BEGIN SELECT RAISE(ABORT, 'injected message commit failure'); END");
+ await assert.rejects(app.command(message), /injected message commit failure/);
+ assert.deepEqual((await app.command({ type: 'task.snapshot', taskId: initial.task.id }) as TaskSnapshot), before);
+ app.store.db.exec('DROP TRIGGER reject_message');
+ const [accepted, stale] = await Promise.allSettled([app.command(message), app.command({ ...message, requestId: id(), text: 'A stale concurrent message' })]);
+ assert.equal(accepted.status, 'fulfilled');
+ assert.equal(stale.status, 'rejected');
+ await until(app, initial.task.id, s => s.task.status === 'ready' && s.task.revision === 2);
+ await assert.rejects(app.command({ ...message, text: 'Different payload with the same identity' }), /different arguments/);
+ uncertainAction(app, initial.task.id, 'run_command');
+ await assert.rejects(app.command({ ...message, requestId: id(), expectedRevision: 2 }), /unknown effects/);
+ const blocked = await app.command({ type: 'task.snapshot', taskId: initial.task.id }) as TaskSnapshot;
+ assert.equal(blocked.task.revision, 2);
+ assert.equal(blocked.task.status, 'waiting_user');
+ assert.equal(blocked.events.filter(e => e.kind === 'user.message').length, 1);
+});
+
+test('conversation messages cannot convert planned tasks or introduce schedules and caller-owned execution state', async t => {
+ const { app, project } = await setup(t);
+ const initial = await app.command(create(project)) as TaskSnapshot;
+ await until(app, initial.task.id, s => s.task.status === 'ready');
+ const message = { type: 'task.message', requestId: id(), taskId: initial.task.id, expectedRevision: 1, text: 'Continue' };
+ await assert.rejects(app.command(message), /require a conversation/);
+ for (const patch of [{ mode: 'finite', intervalMinutes: 1, expiresAt: new Date(Date.now() + 60000).toISOString() }, { expiresAt: new Date(Date.now() + 60000).toISOString() }, { intervalMinutes: 5 }]) await assert.rejects(app.command(create(project, { interaction: 'conversation', ...patch })), /cannot have a recurring schedule or expiry/);
+ for (const patch of [{ text: '   ' }, { turnBudgetStart: 0 }, { expectedRevision: 0 }, { checks: [] }, { status: 'idle' }]) assert.throws(() => parseCommand({ ...message, ...patch }));
+});

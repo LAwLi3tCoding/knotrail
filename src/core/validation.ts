@@ -10,7 +10,8 @@ const impact=z.object({id:key,taskId:key,expectedRevision:revision,expectedPlanI
 const schemas:Record<string,z.ZodType>={
  'bootstrap':z.object({type:z.literal('bootstrap')}).strict(),
  'project.add':z.object({type:z.literal('project.add'),path:text}).strict(),
- 'task.create':z.object({type:z.literal('task.create'),requestId:key,projectId:key,objective:text,checks:checksSchema,executionPolicy:z.enum(['autoWithinGrant','reviewBeforeExecute']),mode:z.enum(['once','finite','maintain']),intervalMinutes:z.number().int().min(1).max(43200).optional(),maxTurns:z.number().int().min(1).max(500).optional(),maxRunMs:z.number().int().min(1000).max(3600000).optional(),expiresAt:z.iso.datetime().optional()}).strict(),
+ 'task.create':z.object({type:z.literal('task.create'),requestId:key,projectId:key,objective:text,checks:checksSchema,executionPolicy:z.enum(['autoWithinGrant','reviewBeforeExecute']),mode:z.enum(['once','finite','maintain']),interaction:z.enum(['conversation','task']).optional(),intervalMinutes:z.number().int().min(1).max(43200).optional(),maxTurns:z.number().int().min(1).max(500).optional(),maxRunMs:z.number().int().min(1000).max(3600000).optional(),expiresAt:z.iso.datetime().optional()}).strict(),
+ 'task.message':z.object({type:z.literal('task.message'),requestId:key,taskId:key,expectedRevision:revision,text:text.refine(v=>v.trim().length>0,'Enter a message')}).strict(),
  'task.applyImpact':z.object({type:z.literal('task.applyImpact'),requestId:key,preview:impact}).strict(),
  'task.previewRevision':z.object({type:z.literal('task.previewRevision'),taskId:key,objective:text.optional(),checks:checksSchema.optional(),expectedRevision:revision}).strict().refine(v=>v.objective!==undefined||v.checks!==undefined,'Provide a revised objective or acceptance checks'),
  'task.previewRetry':z.object({type:z.literal('task.previewRetry'),taskId:key,nodeId:key,expectedRevision:revision}).strict(),

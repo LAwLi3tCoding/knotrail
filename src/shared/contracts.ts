@@ -2,8 +2,8 @@ export const CODEX_BASE_URL = 'https://chatgpt.com/backend-api';
 export const CODEX_RESPONSES_URL = CODEX_BASE_URL + '/codex/responses';
 export type Locale = 'system' | 'zh-CN' | 'en';
 export type TaskMode = 'once' | 'finite' | 'maintain';
-export type TaskStatus = 'planning' | 'ready' | 'executing' | 'verifying' | 'waiting_user' | 'waiting_external' | 'reconciling' | 'blocked' | 'paused' | 'cancelled' | 'expired' | 'completed' | 'healthy' | 'unhealthy' | 'unknown';
-export type NodeStatus = 'queued' | 'running' | 'verified' | 'stale' | 'failed' | 'unknown';
+export type TaskStatus = 'planning' | 'ready' | 'executing' | 'verifying' | 'waiting_user' | 'waiting_external' | 'reconciling' | 'blocked' | 'paused' | 'cancelled' | 'expired' | 'completed' | 'healthy' | 'unhealthy' | 'unknown' | 'idle';
+export type NodeStatus = 'queued' | 'running' | 'verified' | 'stale' | 'failed' | 'unknown' | 'finished';
 export interface CheckSpec { id: string; label: string; command: string[]; protectedPaths: string[] }
 export interface PlanNode { id: string; title: string; goal: string; dependsOn: string[]; kind: 'research' | 'edit' | 'verify'; inputs: string[]; outputs: string[]; checkIds: string[] }
 export interface PlanDraft { sequence: number; summary: string; observations: { kind: 'fact' | 'constraint' | 'proposal'; text: string; source?: string }[]; nodes: PlanNode[] }
@@ -16,6 +16,7 @@ export interface TaskRevision { revision: number; objective: string; checks: Che
 export interface Task {
   id: string; projectId: string; title: string; objective: string; mode: TaskMode; status: TaskStatus;
   revision: number; activePlanId?: string; workdir: string; baseline: string; createdAt: string; updatedAt: string;
+  interaction?: 'conversation' | 'task'; turnBudgetStart?: number;
   executionPolicy: 'autoWithinGrant' | 'reviewBeforeExecute'; checks: CheckSpec[]; error?: string;
   maxTurns: number; maxRunMs: number; turnCount: number; intervalMinutes?: number; nextCheckAt?: string; expiresAt?: string;
   consumedObservations?: Record<string, string>; wait?: WaitState; health?: HealthObservation; acceptedDigest?: string; revisionHistory: TaskRevision[];
@@ -37,7 +38,8 @@ export interface Bootstrap { projects: Project[]; tasks: Task[]; settings: AppSe
 export type AppCommand =
  | { type: 'bootstrap' }
  | { type: 'project.add'; path: string }
- | { type: 'task.create'; requestId: string; projectId: string; objective: string; checks: CheckSpec[]; executionPolicy: Task['executionPolicy']; mode: TaskMode; intervalMinutes?: number; maxTurns?: number; maxRunMs?: number; expiresAt?: string }
+ | { type: 'task.create'; requestId: string; projectId: string; objective: string; checks: CheckSpec[]; executionPolicy: Task['executionPolicy']; mode: TaskMode; interaction?: Task['interaction']; intervalMinutes?: number; maxTurns?: number; maxRunMs?: number; expiresAt?: string }
+ | { type: 'task.message'; requestId: string; taskId: string; expectedRevision: number; text: string }
  | { type: 'task.snapshot' | 'task.inspectEffects'; taskId: string }
  | { type: 'task.pause' | 'task.resume' | 'task.cancel'; taskId: string; expectedRevision: number }
  | { type: 'task.previewRevision'; taskId: string; objective?: string; checks?: CheckSpec[]; expectedRevision: number }

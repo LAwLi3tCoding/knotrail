@@ -24,7 +24,7 @@ const fixture: TaskSnapshot = {
 fixture.plans = [fixture.plan!];
 fixture.task.revisionHistory[0]!.checks = structuredClone(fixture.task.checks);
 
-async function start(page: Page) {
+async function start(page: Page, selectExisting = true) {
   await page.route('https://knotrail.test/**', async route => {
     const name = new URL(route.request().url()).pathname.slice(1);
     if (!['index.html', 'app.js', 'app.css'].includes(name)) return route.abort();
@@ -36,12 +36,13 @@ async function start(page: Page) {
     const listeners: ((event: { taskId?: string; kind: string }) => void)[] = [];
     const commands: AppCommand[] = [];
     const previews: ImpactPreview[] = [];
+    const priorSnapshots: Record<string, TaskSnapshot> = {};
     const preferences: Record<string, unknown> = {};
     const notify = () => listeners.forEach(listener => listener({ taskId: data.task.id, kind: 'changed' }));
     Object.assign(window, { uiTest: {
       commands,
       previews,
-      change: (patch: Partial<TaskSnapshot>) => { Object.assign(data, patch); data.lastSequence++; boot.tasks[0] = data.task; notify(); },
+      change: (patch: Partial<TaskSnapshot>) => { Object.assign(data, patch); data.lastSequence++; boot.tasks = boot.tasks.map(task => task.id === data.task.id ? data.task : task); notify(); },
       snapshot: data,
     } });
     window.knotrail = {
@@ -52,7 +53,7 @@ async function start(page: Page) {
         const result = (() => {
           switch (command.type) {
             case 'bootstrap': return boot;
-            case 'task.snapshot': return data;
+            case 'task.snapshot': return command.taskId === data.task.id ? data : priorSnapshots[command.taskId];
             case 'preferences.get': return preferences[command.taskId] ?? {};
             case 'preferences.save': preferences[command.taskId] = command.value; return { ok: true };
             case 'settings.save': {
@@ -64,6 +65,14 @@ async function start(page: Page) {
             case 'task.pause': data.task.status = 'paused'; data.lastSequence++; notify(); return data;
             case 'task.resume': data.task.status = 'executing'; data.lastSequence++; notify(); return data;
             case 'task.cancel': data.task.status = 'cancelled'; data.lastSequence++; notify(); return data;
+            case 'task.message': {
+              if (data.task.interaction !== 'conversation' || command.taskId !== data.task.id || command.expectedRevision !== data.task.revision) throw new Error('Conversation changed');
+              data.task.revision++; data.task.objective = command.text; data.task.status = 'planning'; data.task.turnBudgetStart = data.task.turnCount;
+              data.task.revisionHistory.push({ revision: data.task.revision, objective: command.text, checks: structuredClone(data.task.checks), createdAt });
+              data.task.activePlanId = undefined; data.task.error = undefined; data.plan = undefined; data.nodes = [];
+              data.events.push({ id: `message-${data.task.revision}`, seq: ++data.lastSequence, taskId: data.task.id, taskRevision: data.task.revision, kind: 'user.message', text: command.text, createdAt });
+              notify(); return data;
+            }
             case 'task.previewRevision': {
               if (command.taskId !== data.task.id || command.expectedRevision !== data.task.revision) throw new Error('Task revision changed');
               if (data.task.mode === 'maintain' && command.checks?.length === 0) throw new Error('Maintenance requires at least one fixed acceptance check');
@@ -88,7 +97,13 @@ async function start(page: Page) {
             case 'task.files': return { files: ['src/adapter.ts', 'README.md'] };
             case 'task.readFile': return { content: 'export const adapter = "safe";', truncated: false };
             case 'model.check': return { ok: true, message: boot.settings.model.authSource === 'codex-login' ? 'Local Codex login is available. Run a task to verify model access and tool calling.' : 'Connection passed' };
-            case 'task.create': Object.assign(data.task, { objective: command.objective, checks: command.checks, mode: command.mode, executionPolicy: command.executionPolicy, status: 'planning', intervalMinutes: command.intervalMinutes, expiresAt: command.expiresAt }); data.lastSequence++; notify(); return data;
+            case 'task.create': {
+              priorSnapshots[data.task.id] = structuredClone(data);
+              const taskId = `task-${boot.tasks.length + 1}`;
+              data.task = { ...data.task, id: taskId, projectId: command.projectId, title: command.objective.split('\n')[0]!.slice(0, 100), objective: command.objective, interaction: command.interaction, checks: command.checks, mode: command.mode, executionPolicy: command.executionPolicy, status: 'planning', revision: 1, activePlanId: undefined, intervalMinutes: command.intervalMinutes, expiresAt: command.expiresAt, turnCount: 0, turnBudgetStart: 0, maxTurns: command.maxTurns ?? 40, maxRunMs: command.maxRunMs ?? 900000, revisionHistory: [{ revision: 1, objective: command.objective, checks: structuredClone(command.checks), createdAt }] };
+              Object.assign(data, { plan: undefined, plans: [], nodes: [], runs: [], checks: [], actions: [], artifacts: [], decisions: [], events: [{ id: `created-${taskId}`, seq: 1, taskId, taskRevision: 1, kind: 'task.created', text: command.objective, createdAt }], lastSequence: 1 });
+              boot.tasks = [data.task, ...boot.tasks]; notify(); return data;
+            }
             case 'project.add': return boot.projects[0];
             default: return { ok: true };
           }
@@ -98,11 +113,30 @@ async function start(page: Page) {
     };
   }, { snapshot: fixture, createdAt: now });
   await page.goto(appUrl);
-  await page.getByRole('button', { name: /Upgrade the adapter/ }).click();
-  await expect(page.getByRole('heading', { name: 'Upgrade the adapter' })).toBeVisible();
+  if (selectExisting) {
+    await page.getByRole('button', { name: /Upgrade the adapter/ }).click();
+    await expect(page.getByRole('heading', { name: 'Upgrade the adapter' })).toBeVisible();
+  } else await expect(page.getByRole('heading', { name: 'New conversation', exact: true })).toBeVisible();
 }
 
-async function delayRevisionResponses(page: Page, commandType: 'task.previewRevision' | 'task.applyImpact' = 'task.previewRevision') {
+async function startConversation(page: Page) {
+  await start(page, false);
+  await page.getByLabel('Message', { exact: true }).fill('Explain the adapter lifecycle.');
+  await page.getByRole('button', { name: 'Send', exact: true }).click();
+  await expect(page.getByRole('textbox', { name: 'Message…', exact: true })).toBeVisible();
+}
+
+async function finishConversationRound(page: Page, response: string) {
+  await page.evaluate(response => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    const s = state.snapshot, revision = s.task.revision, runId = `conversation-run-${revision}`;
+    const plan: NonNullable<TaskSnapshot['plan']> = { id: `conversation-plan-${revision}`, revision, taskRevision: revision, sequence: 1, summary: 'Read the project and answer this message.', observations: [], nodes: [{ id: 'respond', title: 'Respond to the message', goal: s.task.objective, kind: 'research', dependsOn: [], inputs: ['src/adapter.ts'], outputs: ['Answer'], checkIds: [] }], createdAt: s.task.updatedAt, digest: `conversation-plan-digest-${revision}` };
+    state.change({ task: { ...s.task, status: 'idle', activePlanId: plan.id, turnCount: s.task.turnCount + 2 }, plan, plans: [...s.plans, plan], nodes: [{ nodeId: 'respond', status: 'finished', attempt: 1, runId }], runs: [...s.runs, { id: runId, taskId: s.task.id, taskRevision: revision, planId: plan.id, nodeId: 'respond', purpose: 'node', attempt: 1, status: 'succeeded', summary: response, inputDigest: 'conversation-input', startedAt: s.task.updatedAt, endedAt: s.task.updatedAt }], events: [...s.events, { id: `response-${revision}`, seq: s.lastSequence + 1, taskId: s.task.id, taskRevision: revision, planId: plan.id, nodeId: 'respond', runId, kind: 'assistant.response', text: response, createdAt: s.task.updatedAt }] });
+  }, response);
+  await expect(page.locator('.titlebar .status')).toHaveText('Ready for next message');
+}
+
+async function delayRevisionResponses(page: Page, commandType: 'task.previewRevision' | 'task.applyImpact' | 'task.message' | 'task.create' = 'task.previewRevision') {
   await page.evaluate(commandType => {
     const pending: { resolve: () => void; reject: (error: Error) => void }[] = [];
     const state = (window as unknown as { uiTest: object }).uiTest;
@@ -174,13 +208,15 @@ test('new tasks send typed checks, settings save and test a real bridge command,
   await page.getByRole('button', { name: 'src/adapter.ts', exact: true }).click();
   await expect(page.locator('.file-content pre')).toHaveText('export const adapter = "safe";');
   await page.getByRole('button', { name: 'New task', exact: true }).click();
+  await page.locator('.advanced-options > summary').click();
+  await page.getByLabel('Interaction', { exact: true }).selectOption('task');
   await page.getByLabel('Objective', { exact: true }).fill('Implement the missing validation.');
   await page.getByRole('button', { name: 'Add check' }).click();
   await page.getByLabel('Command argv (JSON array)').fill('["npm", "test", "--", "api"]');
   await page.getByLabel('Protected paths (one per line)').fill('test/api.test.ts');
   await page.getByLabel('Execution policy').selectOption('reviewBeforeExecute');
   await page.getByRole('button', { name: 'Create and plan' }).click();
-  await expect(page.getByRole('heading', { name: 'Upgrade the adapter' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Implement the missing validation.' })).toBeVisible();
   await page.getByRole('button', { name: 'Settings', exact: true }).click();
   await page.getByRole('button', { name: 'Models', exact: true }).click();
   await page.getByLabel('API key', { exact: true }).fill('test-only-secret');
@@ -192,6 +228,467 @@ test('new tasks send typed checks, settings save and test a real bridge command,
   const commands = await page.evaluate(() => (window as unknown as { uiTest: { commands: AppCommand[] } }).uiTest.commands);
   expect(commands.find(command => command.type === 'task.create')).toMatchObject({ checks: [{ command: ['npm', 'test', '--', 'api'], protectedPaths: ['test/api.test.ts'] }], executionPolicy: 'reviewBeforeExecute' });
   expect(commands.some(command => command.type === 'model.check')).toBe(true);
+});
+
+test('the default new page starts a conversation with only a project and message', async ({ page }) => {
+  await start(page, false);
+  await expect(page.getByLabel('Project', { exact: true })).toHaveValue('project-1');
+  await expect(page.locator('.advanced-options')).not.toHaveAttribute('open', '');
+  await expect(page.getByLabel('Execution policy')).not.toBeVisible();
+  await expect(page.getByLabel('Maximum turns')).not.toBeVisible();
+  await page.getByLabel('Message', { exact: true }).fill('Explain the adapter lifecycle.');
+  await page.screenshot({ path: test.info().outputPath('new-conversation.png') });
+  await page.getByLabel('Message', { exact: true }).press('Enter');
+  await expect(page.getByRole('heading', { name: 'Explain the adapter lifecycle.', exact: true })).toBeVisible();
+  await expect(page.locator('.conversation [data-event-kind="task.created"]')).toHaveText('Explain the adapter lifecycle.');
+  await expect(page.getByRole('textbox', { name: 'Message…', exact: true })).toHaveValue('');
+  const commands = await page.evaluate(() => (window as unknown as { uiTest: { commands: AppCommand[] } }).uiTest.commands);
+  expect(commands.filter(command => command.type === 'task.create')).toMatchObject([{ interaction: 'conversation', projectId: 'project-1', objective: 'Explain the adapter lifecycle.', mode: 'once', checks: [], executionPolicy: 'autoWithinGrant', maxTurns: 40, maxRunMs: 900000 }]);
+  expect(commands.some(command => ['settings.save', 'task.previewRevision', 'task.applyImpact'].includes(command.type))).toBe(false);
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page.locator('.conversation')).not.toContainText('Completion will require your acceptance.');
+});
+
+test('a new conversation submits once under rapid Enter and button clicks and retains its draft on failure', async ({ page }) => {
+  await start(page, false);
+  await delayRevisionResponses(page, 'task.create');
+  const message = page.getByLabel('Message', { exact: true });
+  await message.fill('Keep this first message if creation fails.');
+  await page.locator('.new-task-page form').evaluate(form => {
+    const field = form.querySelector('textarea')!;
+    const button = form.querySelector<HTMLButtonElement>('button[type="submit"]')!;
+    field.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    button.click();
+    field.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+  });
+  await expect(page.getByRole('button', { name: 'Working…', exact: true })).toBeDisabled();
+  expect(await page.evaluate(() => (window as unknown as { uiTest: { commands: AppCommand[] } }).uiTest.commands.filter(command => command.type === 'task.create'))).toHaveLength(1);
+  await page.evaluate(() => (window as unknown as { uiTest: { settleRevision: (index: number, error?: string) => void } }).uiTest.settleRevision(0, 'Could not create conversation'));
+  await expect(page.getByRole('alert')).toContainText('Could not create conversation');
+  await expect(message).toHaveValue('Keep this first message if creation fails.');
+  await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled();
+});
+
+for (const outcome of ['success', 'failure'] as const) test(`a late conversation creation ${outcome} cannot replace a reopened new-page draft`, async ({ page }) => {
+  await start(page, false);
+  await delayRevisionResponses(page, 'task.create');
+  await page.getByLabel('Message', { exact: true }).fill('First creation');
+  await page.getByRole('button', { name: 'Send', exact: true }).click();
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.getByRole('button', { name: 'New task', exact: true }).click();
+  await page.getByLabel('Message', { exact: true }).fill('Keep the newly opened draft');
+  await page.evaluate(outcome => (window as unknown as { uiTest: { settleRevision: (index: number, error?: string) => void } }).uiTest.settleRevision(0, outcome === 'failure' ? 'Earlier creation failed' : undefined), outcome);
+  await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled();
+  await expect(page.getByLabel('Message', { exact: true })).toHaveValue('Keep the newly opened draft');
+  await expect(page.getByRole('heading', { name: 'New conversation', exact: true })).toBeVisible();
+  await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('a conversation retains messages and plans across rounds, displays finished steps without claiming verification, and remains open', async ({ page }) => {
+  await startConversation(page);
+  await finishConversationRound(page, 'The adapter normalizes the input before calling the service.');
+  await expect(page.getByRole('progressbar', { name: 'Finished steps', exact: true })).toHaveAttribute('value', '1');
+  await expect(page.locator('.plan-tracker .section-heading')).toContainText('1 / 1 Finished steps · 0 Verified');
+  await expect(page.locator('.tracker-step .step-progress')).toHaveText('Finished');
+  await expect(page.locator('.titlebar .status')).toHaveClass(/status-idle/);
+  await expect(page.getByRole('button', { name: 'Accept result', exact: true })).toHaveCount(0);
+  await page.getByRole('textbox', { name: 'Message…', exact: true }).fill('Which tests cover this behavior?');
+  await page.getByRole('textbox', { name: 'Message…', exact: true }).press('Enter');
+  await expect(page.getByRole('textbox', { name: 'Message…', exact: true })).toHaveValue('');
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(page.locator('.conversation [data-event-kind="user.message"] p')).toHaveText('Which tests cover this behavior?');
+  await finishConversationRound(page, 'The adapter tests exercise valid input and rejected input.');
+  await expect(page.locator('.conversation > [data-event-kind]')).toHaveText(['Explain the adapter lifecycle.', /The adapter normalizes the input before calling the service\./, /Which tests cover this behavior\?/, /The adapter tests exercise valid input and rejected input\./]);
+  await page.locator('.composer-footer > details > summary').click();
+  await expect(page.locator('.composer-footer dd').nth(0)).toHaveText('2 / 40');
+  await expect(page.locator('.composer-footer dd').nth(1)).toHaveText('4');
+  await page.getByRole('button', { name: 'Planning', exact: true }).click();
+  const planning = page.getByRole('complementary', { name: 'Planning', exact: true });
+  await planning.getByRole('button', { name: 'Steps', exact: true }).click();
+  await expect(planning.getByRole('button', { name: /Respond to the message.*Finished/ })).toBeVisible();
+  await planning.getByLabel('Plan versions').selectOption('conversation-plan-1');
+  await expect(planning).toContainText('Historical plan');
+  await page.getByRole('button', { name: 'Close planning', exact: true }).click();
+  const state = await page.evaluate(() => (window as unknown as { uiTest: { snapshot: TaskSnapshot; commands: AppCommand[] } }).uiTest);
+  expect(state.snapshot.plans).toHaveLength(2);
+  expect(state.snapshot.task.revisionHistory).toHaveLength(2);
+  expect(state.snapshot.task.status).toBe('idle');
+  expect(state.snapshot.task.acceptedDigest).toBeUndefined();
+  expect(state.commands.filter(command => command.type === 'task.create')).toHaveLength(1);
+  expect(state.commands.filter(command => command.type === 'task.message')).toMatchObject([{ taskId: state.snapshot.task.id, expectedRevision: 1, text: 'Which tests cover this behavior?' }]);
+  expect(state.commands.some(command => command.type === 'task.previewRevision' || command.type === 'task.applyImpact')).toBe(false);
+  await page.getByRole('combobox', { name: 'Language', exact: true }).selectOption('zh-CN');
+  await expect(page.locator('.titlebar .status')).toHaveText('等待下一条消息');
+  await expect(page.locator('.tracker-step .step-progress')).toHaveText('已结束');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator('.sidebar').getByRole('button', { name: '收起导航', exact: true }).click();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+  await page.screenshot({ path: test.info().outputPath('conversation-zh-narrow.png') });
+});
+
+for (const readingHistory of [false, true]) test(`conversation streaming ${readingHistory ? 'respects an intentional upward scroll' : 'keeps the newest answer in the scroll viewport after replanning'}`, async ({ page }) => {
+  await startConversation(page);
+  await page.getByRole('button', { name: 'Planning', exact: true }).click();
+  await page.getByRole('button', { name: 'Terminal', exact: true }).click();
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest, s = state.snapshot;
+    state.change({ events: [...s.events, ...['Inspecting the current value before planning.', 'I will read the value and explain it.', 'Planning complete; the execution policy determines when work starts'].map((text, index) => ({ id: `intro-${index}`, taskId: s.task.id, taskRevision: 1, seq: s.lastSequence + index + 1, kind: index === 2 ? 'plan.ready' : 'assistant.delta', runId: `intro-run-${index}`, text, createdAt: s.task.updatedAt }))], artifacts: [{ id: 'conversation-diff', taskId: s.task.id, runId: 'conversation-run-1', kind: 'diff', name: 'Workspace diff', content: '', digest: 'unchanged-files', truncated: false, createdAt: s.task.updatedAt }] });
+  });
+  await finishConversationRound(page, 'The adapter returns the validated service response.');
+  const scroll = page.locator('.main-scroll');
+  await scroll.evaluate(element => { element.scrollTop = element.scrollHeight; });
+  await expect.poll(() => scroll.evaluate(element => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeLessThanOrEqual(1);
+  await page.evaluate(() => {
+    const original = window.knotrail.command;
+    window.knotrail.command = async <T,>(command: AppCommand): Promise<T> => {
+      // Real IPC replies arrive in a later browser task, after the click has painted.
+      if (command.type === 'task.message') await new Promise(resolve => setTimeout(resolve, 30));
+      return original<T>(command);
+    };
+  });
+  await page.getByRole('textbox', { name: 'Message…', exact: true }).fill('Continue with the error path.');
+  await page.getByRole('button', { name: 'Send', exact: true }).click();
+  await expect(page.locator('.plan-tracker')).toHaveCount(0);
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    const s = state.snapshot, plan = { ...s.plans[0]!, id: 'streaming-plan', taskRevision: s.task.revision, revision: 2, summary: 'Inspect the error path and explain the result.' };
+    state.change({ task: { ...s.task, status: 'executing', activePlanId: plan.id }, plan, plans: [...s.plans, plan], nodes: [{ nodeId: 'respond', status: 'running', attempt: 1, runId: 'streaming-run' }] });
+  });
+  await expect(page.locator('.plan-tracker')).toBeVisible();
+  let historyPosition = 0;
+  for (let index = 0; index < 4; index++) {
+    await page.evaluate(index => {
+      const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+      const s = state.snapshot;
+      state.change({ events: [...s.events, { id: `stream-${index}`, taskId: s.task.id, taskRevision: s.task.revision, planId: s.plan!.id, seq: s.lastSequence + 1, kind: 'assistant.delta', text: `Stream section ${index + 1}.\n${'Inspecting the service error and its caller.\n'.repeat(8)}`, createdAt: s.task.updatedAt, runId: 'streaming-run', nodeId: 'respond' }] });
+    }, index);
+    await expect(page.locator('[data-event-kind="assistant.delta"] p').last()).toContainText(`Stream section ${index + 1}.`);
+    if (readingHistory && index === 0) {
+      await scroll.hover();
+      await page.mouse.wheel(0, -500);
+      await expect.poll(() => scroll.evaluate(element => element.scrollHeight - element.scrollTop - element.clientHeight)).toBeGreaterThan(100);
+      historyPosition = await scroll.evaluate(element => element.scrollTop);
+    }
+  }
+  await finishConversationRound(page, 'The final answer explains the error path without changing the file.');
+  const answer = page.locator('[data-event-kind="assistant.response"]').last();
+  if (readingHistory) {
+    await expect(answer).not.toBeInViewport();
+    await expect.poll(() => scroll.evaluate(element => element.scrollTop)).toBeLessThanOrEqual(historyPosition + 2);
+  } else {
+    await expect(answer).toBeInViewport({ ratio: 1 });
+    const bounds = await answer.evaluate(element => { const viewport = element.closest('.main-scroll')!.getBoundingClientRect(), response = element.getBoundingClientRect(); return { top: response.top - viewport.top, bottom: response.bottom - viewport.bottom }; });
+    expect(bounds.top).toBeGreaterThanOrEqual(0);
+    expect(bounds.bottom).toBeLessThanOrEqual(0);
+  }
+});
+
+test('conversation sends preserve newer drafts, ignore duplicate submissions and respect newline and IME input', async ({ page }) => {
+  await startConversation(page);
+  await delayRevisionResponses(page, 'task.message');
+  const composer = page.getByRole('textbox', { name: 'Message…', exact: true });
+  await composer.fill('First line');
+  await composer.press('Shift+Enter');
+  await composer.pressSequentially('Second line');
+  await expect(composer).toHaveValue('First line\nSecond line');
+  await composer.dispatchEvent('keydown', { key: 'Enter', code: 'Enter', isComposing: true });
+  await composer.dispatchEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 229 });
+  await composer.dispatchEvent('keydown', { key: 'Enter', code: 'Enter', repeat: true });
+  expect(await page.evaluate(() => (window as unknown as { uiTest: { commands: AppCommand[] } }).uiTest.commands.filter(command => command.type === 'task.message'))).toHaveLength(0);
+  await composer.press('Enter');
+  await composer.fill('Keep this newer draft');
+  await composer.press('Enter');
+  await composer.press('Control+Enter');
+  expect(await page.evaluate(() => (window as unknown as { uiTest: { commands: AppCommand[] } }).uiTest.commands.filter(command => command.type === 'task.message'))).toHaveLength(1);
+  await page.evaluate(() => (window as unknown as { uiTest: { settleRevision: (index: number) => void } }).uiTest.settleRevision(0));
+  await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled();
+  await expect(composer).toHaveValue('Keep this newer draft');
+  await composer.press('Control+Enter');
+  await page.evaluate(() => (window as unknown as { uiTest: { settleRevision: (index: number) => void } }).uiTest.settleRevision(1));
+  await expect(composer).toHaveValue('');
+  const state = await page.evaluate(() => (window as unknown as { uiTest: { snapshot: TaskSnapshot; commands: AppCommand[] } }).uiTest);
+  expect(state.commands.filter(command => command.type === 'task.message')).toMatchObject([{ expectedRevision: 1, text: 'First line\nSecond line' }, { expectedRevision: 2, text: 'Keep this newer draft' }]);
+  expect(state.snapshot.events.filter(event => event.kind === 'user.message')).toHaveLength(2);
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+});
+
+test('late conversation snapshots preserve newer status in both the conversation and sidebar', async ({ page }) => {
+  await startConversation(page);
+  await delayRevisionResponses(page, 'task.message');
+  const composer = page.getByRole('textbox', { name: 'Message…', exact: true });
+  await composer.fill('Explain the error path too.');
+  await composer.press('Enter');
+  await finishConversationRound(page, 'The service errors are returned to the caller.');
+  const sidebarTask = page.locator('.task-row').filter({ hasText: 'Explain the adapter lifecycle.' });
+  await expect(sidebarTask).toContainText('Ready for next message');
+  await composer.fill('Keep the next question');
+  await page.evaluate(() => (window as unknown as { uiTest: { settleRevision: (index: number) => void } }).uiTest.settleRevision(0));
+  await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled();
+  await expect(page.locator('.titlebar .status')).toHaveText('Ready for next message');
+  await expect(sidebarTask).toContainText('Ready for next message');
+  await expect(composer).toHaveValue('Keep the next question');
+  await expect(page.locator('.conversation [data-event-kind="assistant.response"] p')).toHaveText('The service errors are returned to the caller.');
+});
+
+for (const delayed of ['preferences.get', 'task.snapshot'] as const) test(`a selected conversation snapshot delayed by ${delayed} cannot undo a same-sequence acceptance preview pause`, async ({ page }) => {
+  await startConversation(page);
+  await finishConversationRound(page, 'Original response');
+  await page.getByRole('button', { name: /Upgrade the adapter/ }).click();
+  await expect(page.getByRole('heading', { name: 'Upgrade the adapter', exact: true })).toBeVisible();
+  await page.evaluate(delayed => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; readHeld?: boolean; releaseRead?: () => void; readReturned?: boolean } }).uiTest;
+    const original = window.knotrail.command; let hold = true;
+    window.knotrail.command = async <T,>(command: AppCommand): Promise<T> => {
+      const result = await original<T>(command);
+      if (command.type === 'task.previewRevision') state.snapshot.lastSequence--;
+      if (command.type === delayed && command.taskId === state.snapshot.task.id && hold) {
+        if (delayed === 'preferences.get') Object.assign(result as object, { draft: 'Loaded preference marker' });
+        hold = false; state.readHeld = true;
+        await new Promise<void>(resolve => { state.releaseRead = resolve; });
+        state.readReturned = true;
+      }
+      return result;
+    };
+  }, delayed);
+  await page.getByRole('button', { name: /Explain the adapter lifecycle/ }).click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { uiTest: { readHeld?: boolean } }).uiTest.readHeld)).toBe(true);
+  await page.evaluate(() => window.knotrail.command({ type: 'settings.save', patch: { locale: 'en' } }));
+  await expect(page.locator('.titlebar .status')).toHaveText('Ready for next message');
+  await page.getByRole('button', { name: 'Edit checks', exact: true }).click();
+  const editor = page.getByRole('dialog', { name: 'Edit checks', exact: true });
+  await editor.getByRole('button', { name: 'Add check', exact: true }).click();
+  await editor.getByLabel('Command argv (JSON array)').fill('["node","check.mjs"]');
+  await editor.getByRole('button', { name: 'Preview impact', exact: true }).click();
+  await expect(page.locator('.titlebar .status')).toHaveText('Paused');
+  await page.getByRole('dialog', { name: 'Review impact', exact: true }).getByRole('button', { name: 'Dismiss', exact: true }).click();
+  await page.evaluate(async () => {
+    (window as unknown as { uiTest: { releaseRead: () => void } }).uiTest.releaseRead();
+    await new Promise(requestAnimationFrame); await new Promise(requestAnimationFrame);
+  });
+  if (delayed === 'preferences.get') await expect(page.getByRole('textbox', { name: 'Message…', exact: true })).toHaveValue('Loaded preference marker');
+  await expect.poll(() => page.evaluate(() => (window as unknown as { uiTest: { readReturned?: boolean } }).uiTest.readReturned)).toBe(true);
+  await expect(page.locator('.titlebar .status')).toHaveText('Paused');
+  await expect(page.getByRole('button', { name: 'Resume', exact: true })).toBeVisible();
+  await expect(page.locator('.task-row').filter({ hasText: 'Explain the adapter lifecycle.' })).toContainText('Paused');
+});
+
+test('a delayed refresh snapshot cannot undo a newer same-sequence pause response', async ({ page }) => {
+  await startConversation(page);
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; commands: AppCommand[]; readHeld?: boolean; releaseRead?: () => void } }).uiTest;
+    const original = window.knotrail.command; let hold = true;
+    window.knotrail.command = async <T,>(command: AppCommand): Promise<T> => {
+      if (command.type === 'task.pause') { state.commands.push(command); state.snapshot.task.status = 'paused'; return structuredClone(state.snapshot) as T; }
+      const result = await original<T>(command);
+      if (command.type === 'task.snapshot' && hold) { hold = false; state.readHeld = true; await new Promise<void>(resolve => { state.releaseRead = resolve; }); }
+      return result;
+    };
+  });
+  await page.evaluate(() => window.knotrail.command({ type: 'settings.save', patch: { locale: 'en' } }));
+  await expect.poll(() => page.evaluate(() => (window as unknown as { uiTest: { readHeld?: boolean } }).uiTest.readHeld)).toBe(true);
+  await page.getByRole('button', { name: 'Pause', exact: true }).click();
+  await expect(page.locator('.titlebar .status')).toHaveText('Paused');
+  await page.evaluate(async () => {
+    (window as unknown as { uiTest: { releaseRead: () => void } }).uiTest.releaseRead();
+    await new Promise(requestAnimationFrame); await new Promise(requestAnimationFrame);
+  });
+  await expect(page.locator('.titlebar .status')).toHaveText('Paused');
+  await expect(page.getByRole('button', { name: 'Resume', exact: true })).toBeVisible();
+  await expect(page.locator('.task-row').filter({ hasText: 'Explain the adapter lifecycle.' })).toContainText('Paused');
+});
+
+for (const update of ['notification', 'command'] as const) test(`a late bootstrap cannot replace a newer conversation ${update} after switching tasks`, async ({ page }) => {
+  await startConversation(page);
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, status: 'executing' } });
+  });
+  await expect(page.locator('.titlebar .status')).toHaveText('Executing');
+  await page.evaluate(() => {
+    const original = window.knotrail.command;
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; commands: AppCommand[]; bootstrapHeld?: boolean; releaseBootstrap?: () => void } }).uiTest;
+    let hold = true;
+    window.knotrail.command = async <T,>(command: AppCommand): Promise<T> => {
+      // A Store.update without an event can return a changed task at the same lastSequence.
+      if (command.type === 'task.pause') { state.commands.push(command); state.snapshot.task.status = 'paused'; return structuredClone(state.snapshot) as T; }
+      const result = await original<T>(command);
+      if (command.type === 'bootstrap' && hold) { hold = false; state.bootstrapHeld = true; await new Promise<void>(resolve => { state.releaseBootstrap = resolve; }); }
+      return result;
+    };
+  });
+  await page.getByRole('button', { name: 'Add project', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { uiTest: { bootstrapHeld?: boolean } }).uiTest.bootstrapHeld)).toBe(true);
+  if (update === 'notification') await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, status: 'blocked', error: 'Current response failed.' } });
+  });
+  else await page.getByRole('button', { name: 'Pause', exact: true }).click();
+  const expected = update === 'notification' ? 'Blocked' : 'Paused';
+  await expect(page.locator('.titlebar .status')).toHaveText(expected);
+  const sidebar = page.locator('.task-row').filter({ hasText: 'Explain the adapter lifecycle.' });
+  await expect(sidebar).toContainText(expected);
+  await page.getByRole('button', { name: /Upgrade the adapter/ }).click();
+  await expect(page.getByRole('heading', { name: 'Upgrade the adapter', exact: true })).toBeVisible();
+  await page.evaluate(() => (window as unknown as { uiTest: { releaseBootstrap: () => void } }).uiTest.releaseBootstrap());
+  await expect(page.getByRole('heading', { name: 'New conversation', exact: true })).toBeVisible();
+  await expect(sidebar).toContainText(expected);
+});
+
+test('late conversation preference loading preserves new edits and restores untouched saved preferences', async ({ page }) => {
+  await startConversation(page);
+  await finishConversationRound(page, 'First response is complete.');
+  await page.getByRole('button', { name: /Upgrade the adapter/ }).click();
+  await expect(page.getByRole('heading', { name: 'Upgrade the adapter', exact: true })).toBeVisible();
+  await page.evaluate(async () => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; preferencesHeld?: boolean; releasePreferences?: () => void } }).uiTest;
+    await window.knotrail.command({ type: 'preferences.save', taskId: state.snapshot.task.id, value: { draft: 'Saved older draft', toolPanel: 'terminal', mainView: 'chat', panelView: 'process', detailTab: 'overview', graphView: 'graph' } });
+    const original = window.knotrail.command; let hold = true;
+    window.knotrail.command = async <T,>(command: AppCommand): Promise<T> => {
+      const result = await original<T>(command);
+      if (command.type === 'preferences.get' && command.taskId === state.snapshot.task.id && hold) { hold = false; state.preferencesHeld = true; await new Promise<void>(resolve => { state.releasePreferences = resolve; }); }
+      return result;
+    };
+  });
+  await page.getByRole('button', { name: /Explain the adapter lifecycle/ }).click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { uiTest: { preferencesHeld?: boolean } }).uiTest.preferencesHeld)).toBe(true);
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, status: 'idle' } });
+  });
+  const composer = page.getByRole('textbox', { name: 'Message…', exact: true });
+  await composer.fill('Important unsent conversation draft');
+  await page.evaluate(() => (window as unknown as { uiTest: { releasePreferences: () => void } }).uiTest.releasePreferences());
+  await expect(composer).toHaveValue('Important unsent conversation draft');
+  await expect(page.locator('.tool-toggles').getByRole('button', { name: 'Terminal', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await expect.poll(() => page.evaluate(async () => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot } }).uiTest;
+    return window.knotrail.command({ type: 'preferences.get', taskId: state.snapshot.task.id });
+  })).toMatchObject({ draft: 'Important unsent conversation draft', toolPanel: 'terminal' });
+});
+
+for (const editWhileLoading of [false, true]) test(`leaving a loading conversation ${editWhileLoading ? 'merges its edits into its own saved preferences' : 'does not replace unread saved preferences with defaults'}`, async ({ page }) => {
+  await startConversation(page);
+  await finishConversationRound(page, 'First response is complete.');
+  await page.getByRole('button', { name: /Upgrade the adapter/ }).click();
+  await expect(page.getByRole('heading', { name: 'Upgrade the adapter', exact: true })).toBeVisible();
+  await page.evaluate(async () => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; preferencesHeld?: boolean; releasePreferences?: () => void } }).uiTest;
+    await window.knotrail.command({ type: 'preferences.save', taskId: state.snapshot.task.id, value: { draft: 'Saved unread conversation draft', toolPanel: 'terminal', mainView: 'chat', panelView: 'process', detailTab: 'artifacts', graphView: 'graph' } });
+    const original = window.knotrail.command; let hold = true;
+    window.knotrail.command = async <T,>(command: AppCommand): Promise<T> => {
+      const result = await original<T>(command);
+      if (command.type === 'preferences.get' && command.taskId === state.snapshot.task.id && hold) { hold = false; state.preferencesHeld = true; await new Promise<void>(resolve => { state.releasePreferences = resolve; }); }
+      return result;
+    };
+  });
+  await page.getByRole('button', { name: /Explain the adapter lifecycle/ }).click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { uiTest: { preferencesHeld?: boolean } }).uiTest.preferencesHeld)).toBe(true);
+  if (editWhileLoading) {
+    await page.evaluate(() => {
+      const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+      state.change({ task: { ...state.snapshot.task, status: 'idle' } });
+    });
+    await page.getByRole('textbox', { name: 'Message…', exact: true }).fill('New draft written before switching away');
+  }
+  await page.getByRole('button', { name: /Upgrade the adapter/ }).click();
+  const otherDraft = page.getByRole('textbox', { name: 'Describe a requirement change…', exact: true });
+  await otherDraft.fill('Keep the separately selected task draft');
+  await page.evaluate(() => (window as unknown as { uiTest: { releasePreferences: () => void } }).uiTest.releasePreferences());
+  await expect.poll(() => page.evaluate(async () => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot } }).uiTest;
+    return window.knotrail.command({ type: 'preferences.get', taskId: state.snapshot.task.id });
+  })).toMatchObject({ draft: editWhileLoading ? 'New draft written before switching away' : 'Saved unread conversation draft', toolPanel: 'terminal', detailTab: 'artifacts' });
+  await expect(otherDraft).toHaveValue('Keep the separately selected task draft');
+  await expect(page.getByRole('heading', { name: 'Upgrade the adapter', exact: true })).toBeVisible();
+});
+
+test('returning to a loading conversation keeps its pending edits and an older read cannot overwrite the new selection', async ({ page }) => {
+  await startConversation(page);
+  await finishConversationRound(page, 'First response is complete.');
+  await page.getByRole('button', { name: /Upgrade the adapter/ }).click();
+  await expect(page.getByRole('heading', { name: 'Upgrade the adapter', exact: true })).toBeVisible();
+  await page.evaluate(async () => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; preferencesHeld?: boolean; releasePreferences?: () => void } }).uiTest;
+    await window.knotrail.command({ type: 'preferences.save', taskId: state.snapshot.task.id, value: { draft: 'Saved older conversation draft', toolPanel: 'terminal', mainView: 'chat', panelView: 'process', detailTab: 'overview', graphView: 'graph' } });
+    const original = window.knotrail.command; let hold = true;
+    window.knotrail.command = async <T,>(command: AppCommand): Promise<T> => {
+      const result = await original<T>(command);
+      if (command.type === 'preferences.get' && command.taskId === state.snapshot.task.id && hold) { hold = false; state.preferencesHeld = true; await new Promise<void>(resolve => { state.releasePreferences = resolve; }); }
+      return result;
+    };
+  });
+  await page.getByRole('button', { name: /Explain the adapter lifecycle/ }).click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { uiTest: { preferencesHeld?: boolean } }).uiTest.preferencesHeld)).toBe(true);
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, status: 'idle' } });
+  });
+  const composer = page.getByRole('textbox', { name: 'Message…', exact: true });
+  await composer.fill('Pending draft from the first selection');
+  await page.getByRole('button', { name: /Upgrade the adapter/ }).click();
+  await expect(page.getByRole('heading', { name: 'Upgrade the adapter', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: /Explain the adapter lifecycle/ }).click();
+  await expect(page.locator('.tool-toggles').getByRole('button', { name: 'Terminal', exact: true })).toHaveAttribute('aria-pressed', 'true');
+  await expect(composer).toHaveValue('Pending draft from the first selection');
+  await composer.fill('Newer draft from the returned selection');
+  await page.evaluate(() => (window as unknown as { uiTest: { releasePreferences: () => void } }).uiTest.releasePreferences());
+  await expect(composer).toHaveValue('Newer draft from the returned selection');
+  await expect.poll(() => page.evaluate(async () => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot } }).uiTest;
+    return window.knotrail.command({ type: 'preferences.get', taskId: state.snapshot.task.id });
+  })).toMatchObject({ draft: 'Newer draft from the returned selection', toolPanel: 'terminal' });
+});
+
+test('a failed conversation send remains visible and retains the original message draft', async ({ page }) => {
+  await startConversation(page);
+  await delayRevisionResponses(page, 'task.message');
+  const composer = page.getByRole('textbox', { name: 'Message…', exact: true });
+  await composer.fill('Keep this message after an error.');
+  await composer.press('Enter');
+  await page.evaluate(() => (window as unknown as { uiTest: { settleRevision: (index: number, error?: string) => void } }).uiTest.settleRevision(0, 'Could not send message'));
+  await expect(page.getByRole('alert')).toContainText('Could not send message');
+  await expect(composer).toHaveValue('Keep this message after an error.');
+  await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeEnabled();
+});
+
+for (const outcome of ['success', 'failure'] as const) test(`a late conversation send ${outcome} cannot alter another task's draft or error`, async ({ page }) => {
+  await startConversation(page);
+  await delayRevisionResponses(page, 'task.message');
+  await page.getByRole('textbox', { name: 'Message…', exact: true }).fill('Send in the conversation');
+  await page.getByRole('textbox', { name: 'Message…', exact: true }).press('Enter');
+  await page.getByRole('button', { name: /Upgrade the adapter/ }).click();
+  const composer = page.getByRole('textbox', { name: 'Describe a requirement change…', exact: true });
+  await composer.fill('Keep the separate task draft');
+  await page.evaluate(outcome => (window as unknown as { uiTest: { settleRevision: (index: number, error?: string) => void } }).uiTest.settleRevision(0, outcome === 'failure' ? 'Earlier conversation response failed' : undefined), outcome);
+  await expect(page.getByRole('button', { name: 'Preview requirement change', exact: true })).toBeEnabled();
+  await expect(composer).toHaveValue('Keep the separate task draft');
+  await expect(page.getByRole('heading', { name: 'Upgrade the adapter', exact: true })).toBeVisible();
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+});
+
+test('planned task advanced options retain finite scheduling and conversation mode omits it', async ({ page }) => {
+  await start(page, false);
+  await page.locator('.advanced-options > summary').click();
+  await page.getByLabel('Interaction', { exact: true }).selectOption('task');
+  await page.getByLabel('Task mode', { exact: true }).selectOption('finite');
+  await page.getByLabel('Expires at', { exact: true }).fill('2099-01-01T12:00');
+  await page.getByLabel('Check interval (minutes)', { exact: true }).fill('12');
+  await page.getByLabel('Maximum turns', { exact: true }).fill('18');
+  await page.getByLabel('Execution policy').selectOption('reviewBeforeExecute');
+  await page.getByRole('button', { name: 'Add check', exact: true }).click();
+  await page.getByLabel('Command argv (JSON array)').fill('["npm","test"]');
+  await page.getByLabel('Interaction', { exact: true }).selectOption('conversation');
+  await expect(page.getByLabel('Task mode', { exact: true })).toHaveCount(0);
+  await expect(page.getByLabel('Expires at', { exact: true })).toHaveCount(0);
+  await page.getByLabel('Message', { exact: true }).fill('Continue with these optional checks.');
+  await page.getByRole('button', { name: 'Send', exact: true }).click();
+  const commands = await page.evaluate(() => (window as unknown as { uiTest: { commands: AppCommand[] } }).uiTest.commands);
+  const created = commands.find(command => command.type === 'task.create');
+  expect(created).toMatchObject({ interaction: 'conversation', mode: 'once', maxTurns: 18, executionPolicy: 'reviewBeforeExecute', checks: [{ command: ['npm', 'test'] }] });
+  expect(created).not.toHaveProperty('expiresAt');
+  expect(created).not.toHaveProperty('intervalMinutes');
 });
 
 test('fixed acceptance edits preview every changed field, preserve cancellation and apply the exact host preview', async ({ page }) => {

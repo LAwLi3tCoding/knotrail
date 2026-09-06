@@ -1,6 +1,6 @@
 # Knotrail 代码文档
 
-对应当前工作区；先读 [原理与架构](../ARCHITECTURE.md)，再沿下面的调用链定位代码。本项目使用 TypeScript、React、Electron、pi SDK 和 Node 内置 SQLite，构建用 esbuild，未引入 ORM、通用工作流引擎或第二套模型循环。本轮等待与维护修复已通过回归、独立复核和实际打包态验证；完整完成度见 [审查记录](COMPLETION-AUDIT.md)。
+对应当前工作区；先读 [原理与架构](../ARCHITECTURE.md)，再沿下面的调用链定位代码。本项目使用 TypeScript、React、Electron、pi SDK 和 Node 内置 SQLite，构建用 esbuild，未引入 ORM、通用工作流引擎或第二套模型循环。等待、维护及本轮快速会话已通过对应回归、独立复核和实际打包态验证；完整完成度见 [审查记录](COMPLETION-AUDIT.md)。
 
 ## 1. 目录与责任
 
@@ -23,7 +23,7 @@
 | `src/execution/sandbox.ts` | 沙箱能力检查、权限配置、helper 启动、取消和回收 |
 | `src/execution/helper.mjs` | 纯 Node stdlib 文件操作、argv 命令、输出限制、父管道断连收尾 |
 | `src/execution/lock.ts` | 内核 flock 与继承的文件描述符 |
-| `src/renderer/App.tsx` | 桌面主壳、任务表单、规划栏、节点详情、工具面板、设置 |
+| `src/renderer/App.tsx` | 桌面主壳、快速会话与高级任务表单、规划栏、节点详情、工具面板、设置 |
 | `src/renderer/i18n.ts` | 中英文界面字典 |
 | `src/renderer/styles.css` | Codex 风格工作台布局、右侧面板、窄屏抽屉和可访问性 |
 | `scripts/build.mjs` | 桌面、Worker、helper 和 Renderer 的构建 |
@@ -51,7 +51,8 @@ interface DesktopAPI {
 | --- | --- | --- |
 | `bootstrap` | 无 | 项目、任务摘要、非敏感设置、沙箱能力 |
 | `project.add` | Git 根目录 | 已有项目或新 Project |
-| `task.create` | requestId、项目、目标、检查、策略、模式和预算 | 新快照；独立工作树；进入只读规划 |
+| `task.create` | requestId、项目、目标、检查、策略、模式和预算；可选 interaction | 新快照；独立工作树；进入只读规划；conversation 仅允许 once 且无周期/到期时间 |
+| `task.message` | requestId、taskId、expectedRevision、非空 text | 仅限 conversation；停止旧 Run 并查证效果；原子追加新版本与消息，在原工作区重新规划 |
 | `task.snapshot` | taskId | 完整持久化快照 |
 | `task.pause` / `task.cancel` | taskId、expectedRevision | 关闭准入、等待实际收尾后暂停或取消 |
 | `task.resume` | taskId、expectedRevision | 先查证未知效果；未消费等待先观察，已有维护记录先复验，其余核对文件证据并继续 |
@@ -67,6 +68,14 @@ interface DesktopAPI {
 | `preferences.get/save` | taskId、视图偏好 | 独立于任务执行的布局与草稿 |
 
 未知命令和字段会失败。需要版本检查的命令收到旧 `expectedRevision` 会要求刷新；重用 requestId 却改变内容会被拒绝。报告另有原生 Save 对话框入口，用户选择路径后 Main 写文件。
+
+`task.message` 的事务同时保存任务版本、user.message 和 requestId；最后一项写入失败时不留下半条消息或已更新的预算。新消息保留 Task.id/title/workdir/checks/executionPolicy 和历史，只撤销当前计划与旧完成资格。`turnBudgetStart` 是宿主维护的累计轮数起点，不接受 Renderer 提交。计划任务仍使用原来的任务总预算；会话只有明确的新消息会获得下一份预算。
+
+会话节点没有 checkIds 时使用 finished，有检查时仍须通过后才能标 verified；调度允许两者作为已结束的依赖。最终检查失败仍阻塞，会话成功后显示 idle。空检查会话不给 acceptedDigest 或人工验收决定，避免把回复结束当作结果合格。`conversationHistory()` 从既有事件提取消息，向当前 Planning/Node Run 提供有限历史；assistant.response 是历史报告，不是新版验证证据。
+
+`NewTask` 默认展示项目、消息和发送按钮，高级配置使用原生 details 折叠。新会话与连续消息均在同步入口阻止重复提交；键盘与按钮共用提交路径，输入法选词不会发送。异步结果按任务选择与编辑器生命期判断是否仍可更新草稿，成功仅清除原提交文本。`acceptSnapshot` 按任务的 lastSequence 拒绝旧返回；bootstrap 还使用刷新代次，并保留请求期间已接收的任务更新。事件序列不覆盖每次状态写入，因此不能只靠 lastSequence 或 updatedAt 判断所有异步返回。
+
+任务快照与偏好独立加载，不让偏好读取延迟快照应用。所有 task.snapshot 读取共用 `readSnapshot`；如果同一任务在读取期间已接收更新，同事件序列的旧读取不能再覆盖它。加载任务偏好期间，界面单独记录已修改字段，读取返回后合并，避免用旧保存值清空新稿；离开仍在加载的任务时，不把默认值覆盖到未读记录。会话自动跟随在布局阶段调整滚动位置，避免计划移除引起的浏览器锚定被误判为人工上滚；用户主动翻阅历史后，更新不会把视图拉回底部。
 
 ## 3. 从创建到完成的函数链
 

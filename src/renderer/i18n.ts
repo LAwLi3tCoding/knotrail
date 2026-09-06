@@ -18,6 +18,14 @@ const zh = {
   'Consumed observation changed or cannot be verified. Review the source and revise or retry explicitly before continuing.': '已使用的观测来源发生变化或无法核实。请检查来源，再修改要求或重做步骤。',
 
   'New task': '新任务', 'Search tasks': '搜索任务', 'Capabilities': '内置能力', 'Scheduled tasks': '定时任务',
+  'New conversation': '新会话', 'Conversation': '连续对话', 'Planned task': '规划任务', 'Interaction': '交互方式', 'Advanced options': '高级选项',
+  'Message': '消息', 'Message…': '发送消息…', 'Send': '发送', 'Message turn budget': '本条消息轮次', 'Total turns': '累计轮次', 'Finished steps': '已结束步骤',
+  'Ask a question or describe what you want to build.': '问一个问题，或描述你想完成的工作。',
+  'Uses your saved model and permissions.': '沿用已保存的模型和权限设置。',
+  'Uses your saved model and permissions. Continue in the same conversation after each response.': '沿用已保存的模型和权限设置，每次回复后都可以继续对话。',
+  'Enter to send · Shift+Enter for a new line. Every message is planned before execution.': 'Enter 发送 · Shift+Enter 换行。每条消息都会先规划再执行。',
+  'No automated checks. You can continue with another message.': '未配置自动检查，可继续发送消息。',
+  'All automated checks will be removed. Responses will finish without automated verification.': '将移除全部自动检查，后续回复结束时不会进行自动验收。',
   'Projects': '项目', 'Add project': '添加项目', 'Settings': '设置', 'Language': '界面语言', 'System': '跟随系统',
   'Collapse navigation': '收起导航', 'Expand navigation': '展开导航', 'No matching tasks': '没有匹配的任务',
   'Choose a project to start': '选择项目，开始工作', 'Open a Git project, describe your goal, and inspect the plan as work progresses.': '打开 Git 项目，描述目标，随时查看规划过程和每一步的实际产出。',
@@ -113,6 +121,7 @@ const zh = {
   'waiting_external': '等待外部条件', 'reconciling': '正在核对', 'blocked': '受阻', 'paused': '已暂停', 'cancelled': '已取消',
   'expired': '已到期', 'completed': '已完成', 'healthy': '检查正常', 'unhealthy': '检查异常', 'queued': '待执行',
   'running': '执行中', 'verified': '已验证', 'stale': '需重新验证', 'failed': '失败', 'unknown': '待确认',
+  'idle': '等待下一条消息', 'finished': '已结束',
   'pending': '进行中', 'succeeded': '成功', 'aborted': '已中止', 'pass': '通过', 'fail': '未通过',
   'waiting': '条件未满足', 'satisfied': '条件已满足',
   'Task steps': '任务步骤', 'Verified steps': '已验证步骤', 'Pending step': '待执行',
@@ -138,6 +147,7 @@ const statusEn: Record<string, string> = {
   healthy: 'Healthy', unhealthy: 'Unhealthy', running: 'Running', verified: 'Verified', stale: 'Stale',
   failed: 'Failed', unknown: 'Unknown', pending: 'Pending', succeeded: 'Succeeded', aborted: 'Aborted', pass: 'Pass', fail: 'Fail',
   waiting: 'Condition unmet', satisfied: 'Condition met',
+  idle: 'Ready for next message', finished: 'Finished',
 };
 export function translator(locale: Locale) {
   const resolved = resolveLocale(locale);

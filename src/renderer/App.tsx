@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
+import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { Activity, ArrowDownToLine, ArrowUp, BookOpen, Check, ChevronDown, ChevronRight, Clock3, Code2, FileCode2, Files, Folder, FolderOpen, GitBranch, GitCompareArrows, Globe2, List, LoaderCircle, Network, PanelLeftClose, PanelLeftOpen, PanelRight, Pause, Play, Plus, Search, Settings2, ShieldCheck, Sparkles, Square, SquarePen, Terminal, X } from 'lucide-react';
 import { CODEX_BASE_URL } from '../shared/contracts';
 import type { AppCommand, AppSettings, Artifact, Bootstrap, CheckSpec, Decision, ImpactPreview, Locale, PlanNode, PlanRevision, Task, TaskEvent, TaskPreferences, TaskSnapshot } from '../shared/contracts';
@@ -15,6 +15,7 @@ const terminalStatuses = new Set(['cancelled', 'expired', 'completed']);
 const dateText = (value: string | undefined, locale: Locale) => value ? new Intl.DateTimeFormat(resolveLocale(locale), { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(value)) : '—';
 const errorText = (error: unknown) => error instanceof Error ? error.message : String(error);
 const pendingDecisions = (snapshot: TaskSnapshot) => snapshot.decisions.filter(decision => !decision.answer && decision.taskRevision === snapshot.task.revision && (snapshot.task.status === 'waiting_user' || decision.kind === 'recovery'));
+const sendsInput = (event: React.KeyboardEvent, enterSends: boolean) => event.key === 'Enter' && !event.repeat && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229 && (event.metaKey || event.ctrlKey || (enterSends && !event.shiftKey && !event.altKey));
 function usageText(runs: TaskSnapshot['runs'], field: 'input' | 'output', locale: Locale, t: T) {
   const modelRuns = runs.filter(run => run.purpose !== 'verification');
   const reported = modelRuns.filter(run => run.usage && Number.isFinite(run.usage[field]));
@@ -44,7 +45,7 @@ export default function App() {
   const selectedRef = useRef(selected); selectedRef.current = selected;
   const [prefs, setPrefs] = useState<TaskPreferences>(defaults);
   const prefsRef = useRef(prefs); prefsRef.current = prefs;
-  const [page, setPage] = useState<Page>('task');
+  const [page, setPage] = useState<Page>('new');
   const [planVersion, setPlanVersion] = useState('current');
   const [settingsTab, setSettingsTab] = useState<'general' | 'models' | 'permissions'>('general');
   const [navCollapsed, setNavCollapsed] = useState(() => window.innerWidth <= 900);
@@ -60,27 +61,51 @@ export default function App() {
   const planRef = useRef<HTMLElement>(null);
   const toggleRef = useRef<HTMLButtonElement>(null);
   const mainRef = useRef<HTMLDivElement>(null);
+  const messageScrollRef = useRef<HTMLDivElement>(null);
+  const followMessages = useRef(true);
   const sideRef = useRef<HTMLElement>(null);
   const prefTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const selectionEpoch = useRef(0);
   const revisionEpoch = useRef(0);
+  const preferenceLoads = useRef(new Map<string, { edits: Partial<TaskPreferences> }>());
+  const refreshGeneration = useRef(0);
+  const snapshotGeneration = useRef(0);
+  const sendingMessages = useRef(new Set<string>());
+  const latestTasks = useRef(new Map<string, { task: Task; sequence: number; generation: number }>());
   const locale = boot?.settings.locale ?? 'system';
   const t = translator(locale);
   const task = snapshot?.task;
+  const conversation = task?.interaction === 'conversation';
   const planOpen = !!boot?.settings.planningOpen;
   const drawer = planOpen && narrow && page === 'task' && !!task;
 
   const acceptSnapshot = useCallback((next: TaskSnapshot) => {
+    if ((latestTasks.current.get(next.task.id)?.sequence ?? -1) > next.lastSequence) return;
+    latestTasks.current.set(next.task.id, { task: next.task, sequence: next.lastSequence, generation: ++snapshotGeneration.current });
     setBoot(previous => previous ? { ...previous, tasks: [...previous.tasks.filter(item => item.id !== next.task.id), next.task].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)) } : previous);
     if (next.task.id !== selectedRef.current) return;
-    setSnapshot(previous => previous && previous.task.id === next.task.id && previous.lastSequence > next.lastSequence ? previous : next);
+    setSnapshot(next);
   }, []);
-  const refresh = useCallback(async () => {
-    const initial = await window.knotrail.command<Bootstrap>({ type: 'bootstrap' });
-    setBoot(initial);
-    const id = selectedRef.current;
-    if (id) acceptSnapshot(await window.knotrail.command<TaskSnapshot>({ type: 'task.snapshot', taskId: id }));
+  const readSnapshot = useCallback(async (taskId: string, isCurrent: () => boolean) => {
+    const knownAtStart = snapshotGeneration.current;
+    const next = await window.knotrail.command<TaskSnapshot>({ type: 'task.snapshot', taskId });
+    const latest = latestTasks.current.get(taskId);
+    // Store-only updates can change status without advancing the event sequence.
+    if (!isCurrent() || (latest && latest.generation > knownAtStart && latest.sequence >= next.lastSequence)) return;
+    acceptSnapshot(next);
   }, [acceptSnapshot]);
+  const refresh = useCallback(async () => {
+    const generation = ++refreshGeneration.current, knownAtStart = snapshotGeneration.current;
+    const initial = await window.knotrail.command<Bootstrap>({ type: 'bootstrap' });
+    if (generation !== refreshGeneration.current) return;
+    setBoot(() => {
+      const tasks = new Map(initial.tasks.map(task => [task.id, task]));
+      for (const [id, latest] of latestTasks.current) if (latest.generation > knownAtStart) tasks.set(id, latest.task);
+      return { ...initial, tasks: [...tasks.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)) };
+    });
+    const id = selectedRef.current;
+    if (id) await readSnapshot(id, () => generation === refreshGeneration.current);
+  }, [readSnapshot]);
   useEffect(() => {
     if (!window.knotrail) { setError('Desktop bridge unavailable. Start this interface through the Knotrail desktop app.'); return; }
     let alive = true;
@@ -105,6 +130,8 @@ export default function App() {
     return () => window.removeEventListener('resize', onResize);
   }, []);
   useEffect(() => { document.documentElement.lang = resolveLocale(locale); }, [locale]);
+  // Apply before native scroll anchoring can report a layout change as a user scroll.
+  useLayoutEffect(() => { if (conversation && page === 'task' && prefs.mainView === 'chat' && followMessages.current) { const element = messageScrollRef.current; element?.scrollTo({ top: element.scrollHeight }); } }, [conversation, snapshot?.lastSequence, page, prefs.mainView, prefs.toolPanel, planOpen, narrow, locale]);
   useEffect(() => {
     mainRef.current?.toggleAttribute('inert', drawer);
     sideRef.current?.toggleAttribute('inert', drawer);
@@ -121,25 +148,30 @@ export default function App() {
     finally { setBusy(value => value - 1); }
   }
   function updatePrefs(patch: Partial<TaskPreferences>) {
+    const id = selectedRef.current, loading = id ? preferenceLoads.current.get(id) : undefined;
+    if (loading) Object.assign(loading.edits, patch);
     const next = { ...prefsRef.current, ...patch };
     prefsRef.current = next; setPrefs(next);
     clearTimeout(prefTimer.current);
-    const id = selectedRef.current;
-    if (id) prefTimer.current = setTimeout(() => { void window.knotrail.command({ type: 'preferences.save', taskId: id, value: next }).catch(cause => setError(errorText(cause))); }, 160);
+    if (id && !loading) prefTimer.current = setTimeout(() => { void window.knotrail.command({ type: 'preferences.save', taskId: id, value: next }).catch(cause => setError(errorText(cause))); }, 160);
   }
   async function selectTask(id: string) {
     const previousId = selectedRef.current;
     clearTimeout(prefTimer.current);
-    if (previousId) void window.knotrail.command({ type: 'preferences.save', taskId: previousId, value: prefsRef.current }).catch(cause => setError(errorText(cause)));
+    if (previousId && !preferenceLoads.current.has(previousId)) void window.knotrail.command({ type: 'preferences.save', taskId: previousId, value: prefsRef.current }).catch(cause => setError(errorText(cause)));
     const epoch = ++selectionEpoch.current;
-    selectedRef.current = id; setSelected(id); setPage('task'); setPlanVersion('current'); if (narrow) setNavCollapsed(true); setSnapshot(undefined); setImpact(undefined); setCheckTask(undefined); setPrefs(defaults()); prefsRef.current = defaults();
+    const loading = { edits: preferenceLoads.current.get(id)?.edits ?? {} }; preferenceLoads.current.set(id, loading);
+    const initialPrefs = { ...defaults(), ...loading.edits };
+    selectedRef.current = id; setSelected(id); setPage('task'); setPlanVersion('current'); followMessages.current = true; if (narrow) setNavCollapsed(true); setSnapshot(undefined); setImpact(undefined); setCheckTask(undefined); setPrefs(initialPrefs); prefsRef.current = initialPrefs;
+    void readSnapshot(id, () => epoch === selectionEpoch.current).catch(cause => { if (epoch === selectionEpoch.current) setError(errorText(cause)); });
     try {
-      const [next, saved] = await Promise.all([
-        window.knotrail.command<TaskSnapshot>({ type: 'task.snapshot', taskId: id }),
-        window.knotrail.command<TaskPreferences>({ type: 'preferences.get', taskId: id }),
-      ]);
-      if (epoch !== selectionEpoch.current) return;
-      acceptSnapshot(next); const value = { ...defaults(), ...saved }; setPrefs(value); prefsRef.current = value;
+      const saved = await window.knotrail.command<TaskPreferences>({ type: 'preferences.get', taskId: id });
+      if (preferenceLoads.current.get(id) !== loading) return;
+      preferenceLoads.current.delete(id);
+      const edits = loading.edits, value = { ...defaults(), ...saved, ...edits };
+      if (epoch !== selectionEpoch.current) { if (Object.keys(edits).length) await window.knotrail.command({ type: 'preferences.save', taskId: id, value }); return; }
+      setPrefs(value); prefsRef.current = value;
+      if (Object.keys(edits).length) updatePrefs({});
     } catch (cause) { if (epoch === selectionEpoch.current) setError(errorText(cause)); }
   }
   async function saveSettings(patch: Extract<AppCommand, { type: 'settings.save' }>['patch']) {
@@ -186,6 +218,19 @@ export default function App() {
   async function previewRequirement(event?: FormEvent) {
     event?.preventDefault(); if (!task || !prefs.draft.trim()) return;
     await previewImpact({ type: 'task.previewRevision', taskId: task.id, expectedRevision: task.revision, objective: `${task.objective}\n\n${prefs.draft.trim()}` }, task, snapshot?.plan, prefs.draft);
+  }
+  async function submitComposer(event?: FormEvent) {
+    event?.preventDefault();
+    if (!conversation) { await previewRequirement(); return; }
+    if (!task || sendingMessages.current.has(task.id)) return;
+    const draft = prefsRef.current.draft;
+    if (!draft.trim()) return;
+    const taskId = task.id, isCurrent = startRevisionOperation(taskId);
+    sendingMessages.current.add(taskId); setPlanVersion('current'); followMessages.current = true; updatePrefs({ mainView: 'chat' });
+    try {
+      const result = await perform<TaskSnapshot>({ type: 'task.message', requestId: uid(), taskId, expectedRevision: task.revision, text: draft.trim() }, isCurrent);
+      if (result && isCurrent() && prefsRef.current.draft === draft) updatePrefs({ draft: '' });
+    } finally { sendingMessages.current.delete(taskId); }
   }
   async function answer(decision: Decision, answerValue: string) {
     if (!task) return;
@@ -252,22 +297,22 @@ export default function App() {
           <div className="subbar"><Tabs values={[[ 'chat', 'Chat'], ['activity', 'Activity'], ['changes', 'Changes']]} current={prefs.mainView} set={mainView => updatePrefs({ mainView })} t={t} />
             <div className="tool-toggles"><IconButton label={t('Files')} pressed={prefs.toolPanel === 'files'} onClick={() => updatePrefs({ toolPanel: prefs.toolPanel === 'files' ? null : 'files' })}><Files /></IconButton><IconButton label={t('Terminal')} pressed={prefs.toolPanel === 'terminal'} onClick={() => updatePrefs({ toolPanel: prefs.toolPanel === 'terminal' ? null : 'terminal' })}><Terminal /></IconButton><IconButton label={t('Preview')} pressed={prefs.toolPanel === 'preview'} onClick={() => updatePrefs({ toolPanel: prefs.toolPanel === 'preview' ? null : 'preview' })}><Code2 /></IconButton></div>
           </div>
-          <div className="main-scroll">
+          <div className="main-scroll" ref={messageScrollRef} onScroll={event => { const element = event.currentTarget; followMessages.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80; }}>
             {prefs.mainView === 'chat' && <Conversation snapshot={snapshot} locale={locale} t={t} busy={!!busy} onAnswer={answer} onInspect={inspectCurrentNode} onChanges={() => updatePrefs({ mainView: 'changes' })} />}
             {prefs.mainView === 'activity' && <ActivityView snapshot={snapshot} locale={locale} t={t} onInspect={inspectCurrentNode} />}
             {prefs.mainView === 'changes' && <div className="inspection"><div className="view-heading"><GitCompareArrows /><h2>{t('Changes')}</h2></div>{snapshot.artifacts.filter(artifact => artifact.kind === 'diff').map(artifact => <ArtifactRow key={artifact.id} artifact={artifact} t={t} />)}{!snapshot.artifacts.some(artifact => artifact.kind === 'diff') && <Empty>{t('No changes yet')}</Empty>}</div>}
           </div>
-          <form className="composer" onSubmit={event => void previewRequirement(event)}>
+          <form className="composer" onSubmit={event => void submitComposer(event)}>
             {chosenNode && <span className="context-chip"><Network />{chosenNode.title}</span>}
-            <textarea aria-label={t('Describe a requirement change…')} maxLength={32000} placeholder={t('Describe a requirement change…')} value={prefs.draft} onChange={event => updatePrefs({ draft: event.target.value })} onKeyDown={event => { if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && !event.nativeEvent.isComposing) { event.preventDefault(); void previewRequirement(); } }} />
+            <textarea aria-label={t(conversation ? 'Message…' : 'Describe a requirement change…')} maxLength={32000} placeholder={t(conversation ? 'Message…' : 'Describe a requirement change…')} value={prefs.draft} onChange={event => updatePrefs({ draft: event.target.value })} onKeyDown={event => { if (sendsInput(event, conversation)) { event.preventDefault(); void submitComposer(); } }} />
             <div className="composer-row"><IconButton label={t('Add selected step to draft')} disabled={!chosenNode} onClick={() => chosenNode && updatePrefs({ draft: `${prefs.draft}${prefs.draft ? '\n' : ''}${chosenNode.title}: ` })}><Plus /></IconButton>
               <button type="button" className="composer-option" onClick={() => showSettings('models')}>{boot.settings.model.modelId || t('Model settings')}<ChevronDown /></button>
               <button type="button" className="composer-option" disabled={!!busy} onClick={() => { dismissRevision(); setCheckTask(structuredClone(task)); }}>{t('Edit checks')}</button>
               <button type="button" className="composer-option permission-chip" onClick={() => showSettings('permissions')}><ShieldCheck />{t(task.executionPolicy === 'reviewBeforeExecute' ? 'Review plan first' : 'Execute within grant')}</button>
-              <button type="submit" className="send-button" aria-label={t('Preview requirement change')} title={t('Preview requirement change')} disabled={!!busy || !prefs.draft.trim()}><ArrowUp /></button>
+              <button type="submit" className="send-button" aria-label={t(conversation ? 'Send' : 'Preview requirement change')} title={t(conversation ? 'Send' : 'Preview requirement change')} disabled={!!busy || !prefs.draft.trim()}><ArrowUp /></button>
             </div>
           </form>
-          <div className="composer-footer"><span>{t('Requirement changes create an impact preview before execution.')}</span><details><summary>{t('Context')}</summary><dl><dt>{t('Turn budget')}</dt><dd>{task.turnCount} / {task.maxTurns}</dd><dt>{t('Input tokens')}</dt><dd>{usageText(snapshot.runs, 'input', locale, t)}</dd><dt>{t('Output tokens')}</dt><dd>{usageText(snapshot.runs, 'output', locale, t)}</dd><dt>{t('Thinking')}</dt><dd>{t(({ off: 'Off', low: 'Low', medium: 'Medium', high: 'High' } as const)[boot.settings.model.thinking])}</dd></dl></details></div>
+          <div className="composer-footer"><span>{t(conversation ? 'Enter to send · Shift+Enter for a new line. Every message is planned before execution.' : 'Requirement changes create an impact preview before execution.')}</span><details><summary>{t('Context')}</summary><dl><dt>{t(conversation ? 'Message turn budget' : 'Turn budget')}</dt><dd>{conversation ? Math.max(0, task.turnCount - (task.turnBudgetStart ?? 0)) : task.turnCount} / {task.maxTurns}</dd>{conversation && <><dt>{t('Total turns')}</dt><dd>{task.turnCount}</dd></>}<dt>{t('Input tokens')}</dt><dd>{usageText(snapshot.runs, 'input', locale, t)}</dd><dt>{t('Output tokens')}</dt><dd>{usageText(snapshot.runs, 'output', locale, t)}</dd><dt>{t('Thinking')}</dt><dd>{t(({ off: 'Off', low: 'Low', medium: 'Medium', high: 'High' } as const)[boot.settings.model.thinking])}</dd></dl></details></div>
           {prefs.toolPanel && <ToolsPanel snapshot={snapshot} panel={prefs.toolPanel} setPanel={toolPanel => updatePrefs({ toolPanel })} t={t} onError={setError} />}
         </div>
         {drawer && <button className="drawer-backdrop" aria-label={t('Close planning')} onClick={() => void togglePlanning(false)} tabIndex={-1} />}
@@ -277,13 +322,13 @@ export default function App() {
           <div className="plan-scroll"><PlanningPanel snapshot={snapshot} prefs={prefs} updatePrefs={updatePrefs} versionId={planVersion} setVersionId={setPlanVersion} t={t} locale={locale} busy={!!busy} onAnswer={answer} onRetry={async nodeId => { await previewImpact({ type: 'task.previewRetry', taskId: task.id, nodeId, expectedRevision: task.revision }, task, snapshot.plan); }} /></div>
         </aside>}
       </div> : selected ? <div className="welcome"><LoaderCircle className="spin" /><p>{t('Working…')}</p></div> : <div className="welcome"><h2>{t('Choose a project to start')}</h2><p>{t('Open a Git project, describe your goal, and inspect the plan as work progresses.')}</p><button className="button primary" onClick={() => boot.projects.length ? setPage('new') : void addProject()}><Plus />{t(boot.projects.length ? 'New task' : 'Open project')}</button></div>
-        : page === 'new' ? <NewTask projects={boot.projects} selectedProjectId={task?.projectId} busy={!!busy} t={t} onAddProject={addProject} onError={setError} onCreate={async command => { const result = await perform<TaskSnapshot>(command); if (result) { await refresh(); await selectTask(result.task.id); } }} />
+        : page === 'new' ? <NewTask projects={boot.projects} selectedProjectId={task?.projectId ?? boot.tasks[0]?.projectId} busy={!!busy} t={t} onAddProject={addProject} onError={setError} onCreate={async (command, editorCurrent) => { const selection = selectionEpoch.current; const isCurrent = () => editorCurrent() && selection === selectionEpoch.current; const result = await perform<TaskSnapshot>(command, isCurrent); if (result && isCurrent()) { await refresh(); if (isCurrent()) await selectTask(result.task.id); } }} />
         : page === 'settings' ? <SettingsPage settings={boot.settings} capabilities={boot.capabilities} tab={settingsTab} setTab={setSettingsTab} t={t} busy={!!busy} save={saveSettings} onTest={async () => { const result = await perform<{ ok: true; message?: string }>({ type: 'model.check' }); if (result) setNotice(result.message ? t(result.message as TextKey) : t('Available')); }} onSaved={() => setNotice(t('Settings saved'))} />
         : page === 'capabilities' ? <Capabilities t={t} />
         : <div className="utility"><p className="muted">{t('Create a finite or maintenance task to schedule checks while the app is running.')}</p><div className="schedule-list">{boot.tasks.filter(item => item.mode !== 'once').map(item => <section key={item.id}><button className="schedule-row" onClick={() => void selectTask(item.id)}><Clock3 /><span><strong>{item.title}</strong><small>{boot.projects.find(project => project.id === item.projectId)?.name} · {t(item.mode === 'finite' ? 'Finite' : 'Maintain')}</small><small>{t('Next check')}: {item.nextCheckAt ? dateText(item.nextCheckAt, locale) : t('No next check')}{item.expiresAt && ` · ${t('Expires at')}: ${dateText(item.expiresAt, locale)}`}</small></span><Status value={item.status} t={t} /><ChevronRight /></button><TaskObservations task={item} locale={locale} t={t} /></section>)}</div>{!boot.tasks.some(item => item.mode !== 'once') && <Empty>{t('No scheduled tasks')}</Empty>}<button className="button" onClick={() => setPage('new')}><Plus />{t('New task')}</button></div>}
     </div>
     {checkTask && !impact && <EditChecks key={`${checkTask.id}:${checkTask.revision}`} task={checkTask} currentTask={task} busy={!!busy} t={t} error={error} onError={setError} onClose={dismissRevision} onPreview={async checks => { if (await previewImpact({ type: 'task.previewRevision', taskId: checkTask.id, expectedRevision: checkTask.revision, checks }, checkTask, snapshot?.plan)) setCheckTask(undefined); }} />}
-    {impact && <Modal title={t('Review impact')} t={t} error={error} onClose={dismissRevision}><p>{t(impact.preview.reason as TextKey)}</p><p className="muted">{t('Generating an impact preview safely pauses the task. Dismissing it leaves the task paused; use Resume to continue unchanged.')}</p><p className="muted">{impact.task.title} · {t('Task revision')} {impact.preview.expectedRevision}</p>{impact.preview.checks !== undefined && <CheckComparison before={impact.task.checks} after={impact.preview.checks} t={t} />}<ImpactList label={t('Affected steps')} ids={impact.preview.affected} plan={impact.plan} t={t} /><ImpactList label={t('Retained steps')} ids={impact.preview.retained} plan={impact.plan} t={t} /><p className="muted">{t('The workspace will keep its current files. Historical attempts remain available.')}</p>{impactStale && <p className="warning" role="alert">{t('This task or plan has changed. Close this preview and generate a new one.')}</p>}<div className="dialog-actions"><button className="button" onClick={dismissRevision}>{t('Dismiss')}</button><button className="button primary" disabled={!!busy || impactStale} onClick={() => void applyImpact()}>{t('Apply and continue')}</button></div></Modal>}
+    {impact && <Modal title={t('Review impact')} t={t} error={error} onClose={dismissRevision}><p>{t(impact.preview.reason as TextKey)}</p><p className="muted">{t('Generating an impact preview safely pauses the task. Dismissing it leaves the task paused; use Resume to continue unchanged.')}</p><p className="muted">{impact.task.title} · {t('Task revision')} {impact.preview.expectedRevision}</p>{impact.preview.checks !== undefined && <CheckComparison before={impact.task.checks} after={impact.preview.checks} t={t} manualAcceptance={impact.task.interaction !== 'conversation'} />}<ImpactList label={t('Affected steps')} ids={impact.preview.affected} plan={impact.plan} t={t} /><ImpactList label={t('Retained steps')} ids={impact.preview.retained} plan={impact.plan} t={t} /><p className="muted">{t('The workspace will keep its current files. Historical attempts remain available.')}</p>{impactStale && <p className="warning" role="alert">{t('This task or plan has changed. Close this preview and generate a new one.')}</p>}<div className="dialog-actions"><button className="button" onClick={dismissRevision}>{t('Dismiss')}</button><button className="button primary" disabled={!!busy || impactStale} onClick={() => void applyImpact()}>{t('Apply and continue')}</button></div></Modal>}
     {cancelOpen && <Modal title={t('Cancel task')} t={t} onClose={() => setCancelOpen(false)}><p>{t('Cancel this task? Work already saved in its worktree will be kept.')}</p><div className="dialog-actions"><button className="button" onClick={() => setCancelOpen(false)}>{t('Keep task')}</button><button className="button danger" disabled={!!busy} onClick={async () => { const result = await taskAction('task.cancel'); if (result) setCancelOpen(false); }}>{t('Confirm cancellation')}</button></div></Modal>}
   </div>;
 }
@@ -346,8 +391,8 @@ function checksAtRevision(task: Task, revision?: number) {
 function CheckDefinition({ check, t }: { check: CheckSpec; t: T }) {
   return <dl className="check-definition"><dt>{t('Check label')}</dt><dd>{check.label}</dd><dt>{t('Command argv (JSON array)')}</dt><dd><code>{JSON.stringify(check.command)}</code></dd><dt>{t('Protected paths')}</dt><dd>{check.protectedPaths.join('\n') || t('None')}</dd></dl>;
 }
-function CheckDefinitions({ checks, t }: { checks?: CheckSpec[]; t: T }) {
-  return checks ? <>{checks.map(check => <details key={check.id}><summary>{check.label}</summary><CheckDefinition check={check} t={t} /></details>)}{!checks.length && <Empty>{t('No automated checks. Completion will require your acceptance.')}</Empty>}</> : <Empty>{t('Check definitions were not recorded for this revision.')}</Empty>;
+function CheckDefinitions({ checks, t, manualAcceptance = true }: { checks?: CheckSpec[]; t: T; manualAcceptance?: boolean }) {
+  return checks ? <>{checks.map(check => <details key={check.id}><summary>{check.label}</summary><CheckDefinition check={check} t={t} /></details>)}{!checks.length && <Empty>{t(manualAcceptance ? 'No automated checks. Completion will require your acceptance.' : 'No automated checks. You can continue with another message.')}</Empty>}</> : <Empty>{t('Check definitions were not recorded for this revision.')}</Empty>;
 }
 function CheckRecord({ check, snapshot, current, locale, t }: { check: TaskSnapshot['checks'][number]; snapshot: TaskSnapshot; current: boolean; locale: Locale; t: T }) {
   const definition = checksAtRevision(snapshot.task, check.taskRevision)?.find(item => item.id === check.conditionId);
@@ -394,9 +439,11 @@ function PlanTracker({ snapshot, locale, t, onInspect }: { snapshot: TaskSnapsho
   const plan = snapshot.plan;
   if (!plan || !currentPlan(snapshot, plan)) return null;
   const verified = plan.nodes.filter(node => stepState(snapshot, plan, node.id)?.status === 'verified').length;
-  return <section className="plan-tracker" aria-label={t('Task steps')}><div className="section-heading"><h3>{t('Task steps')}</h3><span>{verified} / {plan.nodes.length} {t('verified')}</span></div><progress aria-label={t('Verified steps')} max={Math.max(1, plan.nodes.length)} value={verified} /><p className="tracker-caption">{t('Current plan')} · v{plan.revision} · {t('Recorded progress and outputs')}</p><ol className="step-list">{plan.nodes.map((node, index) => {
+  const finished = plan.nodes.filter(node => stepState(snapshot, plan, node.id)?.status === 'finished').length;
+  const conversation = snapshot.task.interaction === 'conversation';
+  return <section className={`plan-tracker ${finished ? 'has-finished' : ''}`} aria-label={t('Task steps')}><div className="section-heading"><h3>{t('Task steps')}</h3><span>{verified + finished} / {plan.nodes.length} {t(conversation || finished ? 'Finished steps' : 'verified')}{(conversation || finished > 0) && ` · ${verified} ${t('verified')}`}</span></div><progress aria-label={t(conversation || finished ? 'Finished steps' : 'Verified steps')} max={Math.max(1, plan.nodes.length)} value={verified + finished} /><p className="tracker-caption">{t('Current plan')} · v{plan.revision} · {t('Recorded progress and outputs')}</p><ol className="step-list">{plan.nodes.map((node, index) => {
     const state = stepState(snapshot, plan, node.id);
-    const status = state?.status === 'verified' ? 'verified' : state?.status === 'running' ? 'Current' : state?.status === 'failed' || state?.status === 'unknown' ? 'blocked' : 'Pending step';
+    const status = state?.status === 'verified' ? 'verified' : state?.status === 'finished' ? 'finished' : state?.status === 'running' ? 'Current' : state?.status === 'failed' || state?.status === 'unknown' ? 'blocked' : 'Pending step';
     return <li key={`${plan.id}:${node.id}`}><details className={`tracker-step tracker-${state?.status ?? 'queued'}`} data-node-id={node.id}><summary><span className="step-number">{state?.status === 'verified' ? <Check /> : index + 1}</span><strong>{node.title}</strong><span className="step-progress">{t(status)}</span></summary><div className="tracker-detail detail-content"><dl><dt>{t('Goal')}</dt><dd>{node.goal}</dd><dt>{t('Declared inputs')}</dt><dd>{node.inputs.join('\n') || t('None')}</dd><dt>{t('Expected outputs')}</dt><dd>{node.outputs.join('\n') || t('None')}</dd><dt>{t('Depends on')}</dt><dd>{node.dependsOn.map(id => plan.nodes.find(item => item.id === id)?.title ?? id).join('\n') || t('None')}</dd></dl>{state?.reason && <p className="warning">{state.reason}</p>}{state?.status === 'stale' && <p className="muted">{t('stale')}</p>}<StepEvidence snapshot={snapshot} node={node} plan={plan} locale={locale} t={t} /><button className="text-button" onClick={() => onInspect(node.id)}>{t('Open in planning')}</button></div></details></li>;
   })}</ol></section>;
 }
@@ -407,13 +454,16 @@ function EventStep({ snapshot, event, t, onInspect }: { snapshot: TaskSnapshot; 
   return planId === snapshot.task.activePlanId && event.taskRevision === snapshot.task.revision && snapshot.plan?.nodes.some(node => node.id === event.nodeId) ? <button className="text-button" onClick={() => onInspect(event.nodeId!)}>{label}</button> : <span>{t('Historical')} · {label}</span>;
 }
 function Conversation({ snapshot, locale, t, busy, onAnswer, onInspect, onChanges }: { snapshot: TaskSnapshot; locale: Locale; t: T; busy: boolean; onAnswer: (decision: Decision, answer: string) => Promise<void>; onInspect: (id: string) => void; onChanges: () => void }) {
-  const messages = conversationEvents(snapshot.events).filter(event => event.kind === 'assistant.delta' || /summary|completed|blocked|waiting|revision|plan\.ready|run\.finished|failed|paused|cancelled/.test(event.kind));
+  const messages = conversationEvents(snapshot.events).filter(event => ['assistant.delta', 'assistant.response', 'user.message'].includes(event.kind) || /summary|completed|blocked|waiting|revision|plan\.ready|run\.finished|failed|paused|cancelled/.test(event.kind));
+  const conversation = snapshot.task.interaction === 'conversation';
+  const currentMessage = conversation ? messages.findLast(event => event.kind === 'user.message' && event.taskRevision === snapshot.task.revision) : undefined;
+  const firstMessage = snapshot.events.find(event => event.kind === 'task.created');
   const diffCount = snapshot.artifacts.filter(artifact => artifact.kind === 'diff').length;
   const activeRun = snapshot.runs.find(run => run.status === 'running' && run.taskRevision === snapshot.task.revision && run.planId === snapshot.task.activePlanId);
   return <div className="conversation">
-    <div className="user-message">{snapshot.task.revisionHistory[0]?.objective ?? snapshot.task.objective}</div>
-    <PlanTracker snapshot={snapshot} locale={locale} t={t} onInspect={onInspect} />
-    {messages.map(event => <article className={`message ${event.kind.includes('revision') ? 'revision-message' : ''}`} key={event.id}><div className="message-meta"><time>{dateText(event.createdAt, locale)}</time><EventStep snapshot={snapshot} event={event} t={t} onInspect={onInspect} /></div><p>{event.text}</p></article>)}
+    <div className="user-message" data-event-kind="task.created">{firstMessage?.text ?? snapshot.task.revisionHistory[0]?.objective ?? snapshot.task.objective}</div>
+    {!currentMessage && <PlanTracker snapshot={snapshot} locale={locale} t={t} onInspect={onInspect} />}
+    {messages.map(event => <Fragment key={event.id}><article className={event.kind === 'user.message' ? 'user-message' : `message ${event.kind.includes('revision') ? 'revision-message' : ''}`} data-event-kind={event.kind}><div className="message-meta"><time>{dateText(event.createdAt, locale)}</time><EventStep snapshot={snapshot} event={event} t={t} onInspect={onInspect} /></div><p>{event.text}</p></article>{event.id === currentMessage?.id && <PlanTracker snapshot={snapshot} locale={locale} t={t} onInspect={onInspect} />}</Fragment>)}
     {!messages.length && snapshot.draft?.summary && <article className="message"><p>{snapshot.draft.summary}</p></article>}
     {!messages.length && !snapshot.draft && <p className="muted">{t(snapshot.task.status)}</p>}
     {snapshot.task.error && <div className="warning">{t(snapshot.task.error as TextKey)}</div>}
@@ -422,7 +472,7 @@ function Conversation({ snapshot, locale, t, busy, onAnswer, onInspect, onChange
     {pendingDecisions(snapshot).map(decision => <DecisionCard key={decision.id} decision={decision} artifacts={snapshot.artifacts} t={t} busy={busy} onAnswer={onAnswer} />)}
     {snapshot.decisions.some(decision => decision.answer) && <details className="history-section step-decisions"><summary>{t('Recorded decisions')}</summary>{snapshot.decisions.filter(decision => decision.answer).sort((a, b) => a.createdAt.localeCompare(b.createdAt)).map(decision => <DecisionRecord key={decision.id} decision={decision} locale={locale} t={t} />)}</details>}
     {activeRun && <div className="running-line" role="status"><LoaderCircle className="spin" /><span>{activeRun.purpose === 'verification' ? t('Maintenance verification') : activeRun.nodeId ? snapshot.plan?.nodes.find(node => node.id === activeRun.nodeId)?.title ?? activeRun.nodeId : t('planning')}</span><small>{t('Attempt')} {activeRun.attempt}</small></div>}
-    {snapshot.task.revisionHistory.length > 1 && <details className="history-section task-revisions"><summary>{t('Task revisions')} · {snapshot.task.revisionHistory.length}</summary>{snapshot.task.revisionHistory.map(revision => <details key={revision.revision}><summary>v{revision.revision} · {dateText(revision.createdAt, locale)}</summary><p>{revision.objective}</p><CheckDefinitions checks={revision.checks} t={t} /></details>)}</details>}
+    {snapshot.task.revisionHistory.length > 1 && <details className="history-section task-revisions"><summary>{t('Task revisions')} · {snapshot.task.revisionHistory.length}</summary>{snapshot.task.revisionHistory.map(revision => <details key={revision.revision}><summary>v{revision.revision} · {dateText(revision.createdAt, locale)}</summary><p>{revision.objective}</p><CheckDefinitions checks={revision.checks} t={t} manualAcceptance={!conversation} /></details>)}</details>}
   </div>;
 }
 function ActivityView({ snapshot, t, locale, onInspect }: { snapshot: TaskSnapshot; t: T; locale: Locale; onInspect: (id: string) => void }) {
@@ -450,7 +500,7 @@ function PlanningPanel({ snapshot, prefs, updatePrefs, versionId, setVersionId, 
       {planEvents.map(event => <details className="process-event" key={event.id}><summary><span>{event.text.slice(0, 120)}</span><small>{dateText(event.createdAt, locale)}</small></summary><p>{event.text}</p>{event.data !== undefined && <pre>{JSON.stringify(event.data, null, 2)}</pre>}</details>)}
       {!source && !planEvents.length && <Empty>{t('The plan will appear here as it is recorded.')}</Empty>}
       {pendingDecisions(snapshot).map(decision => <DecisionCard key={decision.id} decision={decision} artifacts={snapshot.artifacts} t={t} busy={busy} onAnswer={onAnswer} />)}
-      <section className="conditions"><h3>{t('Checks')}</h3><CheckDefinitions checks={definitions} t={t} /></section>
+      <section className="conditions"><h3>{t('Checks')}</h3><CheckDefinitions checks={definitions} t={t} manualAcceptance={snapshot.task.interaction !== 'conversation'} /></section>
     </div> : <>
       <div className="graph-toolbar"><select aria-label={t('Plan versions')} value={versionId} onChange={event => setVersionId(event.target.value)}><option value="current">{t('Current plan')}{snapshot.plan ? ` · v${snapshot.plan.revision}` : ''}</option>{snapshot.plans.filter(item => item.id !== snapshot.plan?.id).map(item => <option key={item.id} value={item.id}>v{item.revision} · {dateText(item.createdAt, locale)}</option>)}</select><div className="row"><IconButton label={t('Graph')} pressed={prefs.graphView === 'graph'} onClick={() => updatePrefs({ graphView: 'graph' })}><Network /></IconButton><IconButton label={t('List')} pressed={prefs.graphView === 'list'} onClick={() => updatePrefs({ graphView: 'list' })}><List /></IconButton></div></div>
       {source?.nodes.length ? <div className={`node-graph ${prefs.graphView === 'list' ? 'node-list' : ''}`}>
@@ -508,11 +558,11 @@ function parseCheckInputs(checks: CheckInput[]): CheckSpec[] {
     return { id: check.id, label: check.label.trim() || (command as string[]).join(' '), command: command as string[], protectedPaths: check.protectedPaths.split('\n').map(path => path.trim()).filter(Boolean) };
   });
 }
-function CheckFields({ checks, setChecks, t, requireChecks = false }: { checks: CheckInput[]; setChecks: (value: CheckInput[]) => void; t: T; requireChecks?: boolean }) {
+function CheckFields({ checks, setChecks, t, requireChecks = false, manualAcceptance = true }: { checks: CheckInput[]; setChecks: (value: CheckInput[]) => void; t: T; requireChecks?: boolean; manualAcceptance?: boolean }) {
   const update = (id: string, patch: Partial<CheckInput>) => setChecks(checks.map(check => check.id === id ? { ...check, ...patch } : check));
   return <section className="form-section"><div className="section-heading"><h3>{t('Check commands')}</h3><button type="button" className="button compact" onClick={() => setChecks([...checks, { id: `check-${uid().slice(0, 8)}`, label: '', argv: '', protectedPaths: '' }])}><Plus />{t('Add check')}</button></div><p className="field-hint">{t('Commands are argv arrays, not shell scripts. Use project tests that verify the requested behavior.')}</p><p className="field-hint">{t('Only run trusted repositories and commands. The macOS file/network sandbox is not a VM; deliberately detached daemons may escape process cleanup.')}</p>
     {checks.map((check, index) => <fieldset className="check-editor" key={check.id}><legend>{t('Condition')} {index + 1}</legend><IconButton className="check-remove" label={`${t('Remove check')} ${index + 1}`} onClick={() => setChecks(checks.filter(item => item.id !== check.id))}><X /></IconButton><div className="field"><label htmlFor={`label-${check.id}`}>{t('Check label')}</label><input id={`label-${check.id}`} value={check.label} onChange={event => update(check.id, { label: event.target.value })} /></div><div className="field"><label htmlFor={`argv-${check.id}`}>{t('Command argv (JSON array)')}</label><input id={`argv-${check.id}`} className="mono" value={check.argv} required placeholder='["npm", "test"]' onChange={event => update(check.id, { argv: event.target.value })} /></div><div className="field"><label htmlFor={`paths-${check.id}`}>{t('Protected paths (one per line)')}</label><textarea id={`paths-${check.id}`} rows={2} value={check.protectedPaths} onChange={event => update(check.id, { protectedPaths: event.target.value })} /><small>{t('These files are protected from agent edits while running the check.')}</small></div></fieldset>)}
-    {!checks.length && <p className="warning" role={requireChecks ? 'alert' : undefined}>{t(requireChecks ? 'Maintenance requires at least one fixed acceptance check' : 'No automated checks. Completion will require your acceptance.')}</p>}
+    {!checks.length && <p className={manualAcceptance || requireChecks ? "warning" : "field-hint"} role={requireChecks ? 'alert' : undefined}>{t(requireChecks ? 'Maintenance requires at least one fixed acceptance check' : manualAcceptance ? 'No automated checks. Completion will require your acceptance.' : 'No automated checks. You can continue with another message.')}</p>}
   </section>;
 }
 function EditChecks({ task, currentTask, busy, t, error, onError, onClose, onPreview }: { task: Task; currentTask?: Task; busy: boolean; t: T; error: string; onError: (message: string) => void; onClose: () => void; onPreview: (checks: CheckSpec[]) => Promise<void> }) {
@@ -527,18 +577,19 @@ function EditChecks({ task, currentTask, busy, t, error, onError, onClose, onPre
     catch { onError(t('Each command must be a nonempty JSON array of strings.')); return; }
     await onPreview(parsed);
   }
-  return <Modal title={t('Edit checks')} t={t} error={error} onClose={onClose}><p className="muted">{task.title} · {t('Task revision')} {task.revision}</p><p>{t('Edit the fixed acceptance checks. Preview pauses the task and shows the changes; applying creates a new task revision and plan.')}</p><form onSubmit={event => void submit(event)}><CheckFields checks={checks} setChecks={setChecks} t={t} requireChecks={task.mode === 'maintain'} />{stale && <p className="warning" role="alert">{t('This task has changed. Close this editor and reopen it from the current revision.')}</p>}<div className="dialog-actions"><button type="button" className="button" onClick={onClose}>{t('Cancel editing')}</button><button className="button primary" type="submit" disabled={busy || stale || emptyMaintenance || JSON.stringify(checks) === JSON.stringify(checkInputs(task.checks))}>{t('Preview impact')}</button></div></form></Modal>;
+  return <Modal title={t('Edit checks')} t={t} error={error} onClose={onClose}><p className="muted">{task.title} · {t('Task revision')} {task.revision}</p><p>{t('Edit the fixed acceptance checks. Preview pauses the task and shows the changes; applying creates a new task revision and plan.')}</p><form onSubmit={event => void submit(event)}><CheckFields checks={checks} setChecks={setChecks} t={t} requireChecks={task.mode === 'maintain'} manualAcceptance={task.interaction !== 'conversation'} />{stale && <p className="warning" role="alert">{t('This task has changed. Close this editor and reopen it from the current revision.')}</p>}<div className="dialog-actions"><button type="button" className="button" onClick={onClose}>{t('Cancel editing')}</button><button className="button primary" type="submit" disabled={busy || stale || emptyMaintenance || JSON.stringify(checks) === JSON.stringify(checkInputs(task.checks))}>{t('Preview impact')}</button></div></form></Modal>;
 }
-function CheckComparison({ before, after, t }: { before: CheckSpec[]; after: CheckSpec[]; t: T }) {
+function CheckComparison({ before, after, t, manualAcceptance = true }: { before: CheckSpec[]; after: CheckSpec[]; t: T; manualAcceptance?: boolean }) {
   const ids = [...new Set([...before, ...after].map(check => check.id))];
   return <section className="check-comparison"><h3>{t('Acceptance changes')}</h3>{ids.map(id => {
     const previous = before.find(check => check.id === id), next = after.find(check => check.id === id);
     return <section className="check-change" key={id}><h4><code>{id}</code><span>{t(!previous ? 'Added' : !next ? 'Removed' : JSON.stringify(previous) === JSON.stringify(next) ? 'Unchanged' : 'Changed')}</span></h4><div className="check-comparison-columns"><section aria-label={t('Before')}><h4>{t('Before')}</h4>{previous ? <CheckDefinition check={previous} t={t} /> : <p className="muted">{t('None')}</p>}</section><section aria-label={t('After')}><h4>{t('After')}</h4>{next ? <CheckDefinition check={next} t={t} /> : <p className="muted">{t('None')}</p>}</section></div></section>;
-  })}{!!before.length && !after.length && <p className="warning">{t('All automated checks will be removed. Completion will require your manual acceptance of the result.')}</p>}</section>;
+  })}{!!before.length && !after.length && <p className="warning">{t(manualAcceptance ? 'All automated checks will be removed. Completion will require your manual acceptance of the result.' : 'All automated checks will be removed. Responses will finish without automated verification.')}</p>}</section>;
 }
-function NewTask({ projects, selectedProjectId, busy, t, onAddProject, onError, onCreate }: { projects: Bootstrap['projects']; selectedProjectId?: string; busy: boolean; t: T; onAddProject: () => Promise<void>; onError: (error: string) => void; onCreate: (command: Extract<AppCommand, { type: 'task.create' }>) => Promise<void> }) {
-  const [projectId, setProjectId] = useState(selectedProjectId ?? projects[0]?.id ?? '');
+function NewTask({ projects, selectedProjectId, busy, t, onAddProject, onError, onCreate }: { projects: Bootstrap['projects']; selectedProjectId?: string; busy: boolean; t: T; onAddProject: () => Promise<void>; onError: (error: string) => void; onCreate: (command: Extract<AppCommand, { type: 'task.create' }>, isCurrent: () => boolean) => Promise<void> }) {
+  const [projectId, setProjectId] = useState(() => projects.some(project => project.id === selectedProjectId) ? selectedProjectId! : projects[0]?.id ?? '');
   const [objective, setObjective] = useState('');
+  const [interaction, setInteraction] = useState<NonNullable<Task['interaction']>>('conversation');
   const [mode, setMode] = useState<Task['mode']>('once');
   const [policy, setPolicy] = useState<Task['executionPolicy']>('autoWithinGrant');
   const [checks, setChecks] = useState<CheckInput[]>([]);
@@ -547,27 +598,35 @@ function NewTask({ projects, selectedProjectId, busy, t, onAddProject, onError, 
   const [interval, setInterval] = useState(30);
   const [expiry, setExpiry] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const submittingRef = useRef(false);
+  const mounted = useRef(true);
+  const conversation = interaction === 'conversation';
+  const activeMode = conversation ? 'once' : mode;
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
   useEffect(() => { if (!projectId && projects[0]) setProjectId(projects[0].id); }, [projects, projectId]);
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (!objective.trim() || !projectId) return;
+    if (busy || submittingRef.current || !objective.trim() || !projectId) return;
     let parsed: CheckSpec[];
     try { parsed = parseCheckInputs(checks); }
     catch { onError(t('Each command must be a nonempty JSON array of strings.')); return; }
-    if (mode === 'finite' && (!expiry || new Date(expiry).getTime() <= Date.now())) { onError(t('Enter a future expiry time for a finite task.')); return; }
-    setSubmitting(true);
-    try { await onCreate({ type: 'task.create', requestId: uid(), projectId, objective: objective.trim(), checks: parsed, executionPolicy: policy, mode, maxTurns: turns, maxRunMs: minutes * 60_000, ...(mode !== 'once' ? { intervalMinutes: interval } : {}), ...(mode === 'finite' ? { expiresAt: new Date(expiry).toISOString() } : {}) }); }
-    finally { setSubmitting(false); }
+    if (activeMode === 'maintain' && !parsed.length) { onError(t('Maintenance requires at least one fixed acceptance check')); return; }
+    if (activeMode === 'finite' && (!expiry || new Date(expiry).getTime() <= Date.now())) { onError(t('Enter a future expiry time for a finite task.')); return; }
+    submittingRef.current = true; setSubmitting(true);
+    try { await onCreate({ type: 'task.create', requestId: uid(), projectId, objective: objective.trim(), interaction, checks: parsed, executionPolicy: policy, mode: activeMode, maxTurns: turns, maxRunMs: minutes * 60_000, ...(activeMode !== 'once' ? { intervalMinutes: interval } : {}), ...(activeMode === 'finite' ? { expiresAt: new Date(expiry).toISOString() } : {}) }, () => mounted.current); }
+    finally { submittingRef.current = false; if (mounted.current) setSubmitting(false); }
   }
-  return <div className="utility new-task-page"><form onSubmit={event => void submit(event)}><div className="form-intro"><SquarePen /><h2>{t('New task')}</h2><p>{t('What should change, and how will you know it works?')}</p></div>
-    <div className="field"><label htmlFor="project-choice">{t('Project')}</label><div className="row"><select id="project-choice" value={projectId} required onChange={event => setProjectId(event.target.value)}>{!projects.length && <option value="">{t('Choose a project')}</option>}{projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}</select><button type="button" className="button" onClick={() => void onAddProject()}><FolderOpen />{t('Open project')}</button></div></div>
-    <div className="field"><label htmlFor="task-objective">{t('Objective')}</label><textarea id="task-objective" required rows={5} maxLength={32000} value={objective} placeholder={t('What should change, and how will you know it works?')} onChange={event => setObjective(event.target.value)} /></div>
-    <div className="form-columns"><div className="field"><label htmlFor="task-policy">{t('Execution policy')}</label><select id="task-policy" value={policy} onChange={event => setPolicy(event.target.value as typeof policy)}><option value="autoWithinGrant">{t('Execute within grant')}</option><option value="reviewBeforeExecute">{t('Review plan first')}</option></select></div><div className="field"><label htmlFor="task-mode">{t('Task mode')}</label><select id="task-mode" value={mode} onChange={event => setMode(event.target.value as typeof mode)}><option value="once">{t('Once')}</option><option value="finite">{t('Finite')}</option><option value="maintain">{t('Maintain')}</option></select></div></div>
-    <p className="field-hint">{t('Once runs to completion. Finite resumes external waits until expiry. Maintain checks on a schedule.')}</p>
-    <CheckFields checks={checks} setChecks={setChecks} t={t} requireChecks={mode === 'maintain'} />
-    <section className="form-section"><h3>{t('Turn budget')}</h3><div className="form-columns"><div className="field"><label htmlFor="max-turns">{t('Maximum turns')}</label><input id="max-turns" type="number" min={1} max={500} step={1} value={turns} required onChange={event => setTurns(Number(event.target.value))} /></div><div className="field"><label htmlFor="max-minutes">{t('Maximum run time (minutes)')}</label><input id="max-minutes" type="number" min={1} max={60} value={minutes} required onChange={event => setMinutes(Number(event.target.value))} /></div></div>
-      {mode !== 'once' && <div className="form-columns"><div className="field"><label htmlFor="interval">{t('Check interval (minutes)')}</label><input id="interval" type="number" min={1} max={10080} value={interval} required onChange={event => setInterval(Number(event.target.value))} /></div>{mode === 'finite' && <div className="field"><label htmlFor="expires">{t('Expires at')}</label><input id="expires" type="datetime-local" value={expiry} required onChange={event => setExpiry(event.target.value)} /></div>}</div>}
-    </section><div className="form-actions"><button type="submit" className="button primary" disabled={busy || submitting || !objective.trim() || !projectId}>{submitting ? <LoaderCircle className="spin" /> : <Sparkles />}{t(submitting ? 'Creating task…' : 'Create and plan')}</button></div>
+  return <div className="utility new-task-page"><form onSubmit={event => void submit(event)}><div className="form-intro"><h2>{t(conversation ? 'New conversation' : 'New task')}</h2><p>{t(conversation ? 'Ask a question or describe what you want to build.' : 'What should change, and how will you know it works?')}</p></div>
+    <div className="field"><label htmlFor="project-choice">{t('Project')}</label><div className="row"><select id="project-choice" value={projectId} required disabled={submitting} onChange={event => setProjectId(event.target.value)}>{!projects.length && <option value="">{t('Choose a project')}</option>}{projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}</select><button type="button" className="button" disabled={submitting} onClick={() => void onAddProject()}><FolderOpen />{t('Open project')}</button></div></div>
+    <div className="field"><label htmlFor="task-objective">{t(conversation ? 'Message' : 'Objective')}</label><textarea id="task-objective" required autoFocus readOnly={submitting} rows={5} maxLength={32000} value={objective} placeholder={t(conversation ? 'Message…' : 'What should change, and how will you know it works?')} onChange={event => setObjective(event.target.value)} onKeyDown={event => { if (sendsInput(event, conversation)) { event.preventDefault(); event.currentTarget.form?.requestSubmit(); } }} /></div>
+    <div className="quick-task-actions"><p className="field-hint">{t(conversation ? 'Uses your saved model and permissions. Continue in the same conversation after each response.' : 'Uses your saved model and permissions.')}</p><button type="submit" className="button primary" disabled={busy || submitting || !objective.trim() || !projectId}>{submitting ? <LoaderCircle className="spin" /> : <ArrowUp />}{t(submitting ? 'Working…' : conversation ? 'Send' : 'Create and plan')}</button></div>
+    <details className="advanced-options"><summary>{t('Advanced options')}</summary><div className="form-columns"><div className="field"><label htmlFor="task-interaction">{t('Interaction')}</label><select id="task-interaction" value={interaction} disabled={submitting} onChange={event => setInteraction(event.target.value as typeof interaction)}><option value="conversation">{t('Conversation')}</option><option value="task">{t('Planned task')}</option></select></div><div className="field"><label htmlFor="task-policy">{t('Execution policy')}</label><select id="task-policy" value={policy} onChange={event => setPolicy(event.target.value as typeof policy)}><option value="autoWithinGrant">{t('Execute within grant')}</option><option value="reviewBeforeExecute">{t('Review plan first')}</option></select></div></div>
+      {!conversation && <><div className="field"><label htmlFor="task-mode">{t('Task mode')}</label><select id="task-mode" value={mode} onChange={event => setMode(event.target.value as typeof mode)}><option value="once">{t('Once')}</option><option value="finite">{t('Finite')}</option><option value="maintain">{t('Maintain')}</option></select></div><p className="field-hint">{t('Once runs to completion. Finite resumes external waits until expiry. Maintain checks on a schedule.')}</p></>}
+      <CheckFields checks={checks} setChecks={setChecks} t={t} requireChecks={activeMode === 'maintain'} manualAcceptance={!conversation} />
+      <section className="form-section"><h3>{t(conversation ? 'Message turn budget' : 'Turn budget')}</h3><div className="form-columns"><div className="field"><label htmlFor="max-turns">{t('Maximum turns')}</label><input id="max-turns" type="number" min={1} max={500} step={1} value={turns} required onChange={event => setTurns(Number(event.target.value))} /></div><div className="field"><label htmlFor="max-minutes">{t('Maximum run time (minutes)')}</label><input id="max-minutes" type="number" min={1} max={60} value={minutes} required onChange={event => setMinutes(Number(event.target.value))} /></div></div>
+        {activeMode !== 'once' && <div className="form-columns"><div className="field"><label htmlFor="interval">{t('Check interval (minutes)')}</label><input id="interval" type="number" min={1} max={10080} value={interval} required onChange={event => setInterval(Number(event.target.value))} /></div>{activeMode === 'finite' && <div className="field"><label htmlFor="expires">{t('Expires at')}</label><input id="expires" type="datetime-local" value={expiry} required onChange={event => setExpiry(event.target.value)} /></div>}</div>}
+      </section>
+    </details>
   </form></div>;
 }
 function SettingsPage({ settings, capabilities, tab, setTab, t, busy, save, onTest, onSaved }: { settings: AppSettings; capabilities: Bootstrap['capabilities']; tab: 'general' | 'models' | 'permissions'; setTab: (tab: 'general' | 'models' | 'permissions') => void; t: T; busy: boolean; save: (patch: Extract<AppCommand, { type: 'settings.save' }>['patch']) => Promise<AppSettings | undefined>; onTest: () => Promise<void>; onSaved: () => void }) {

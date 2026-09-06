@@ -32,6 +32,21 @@ const responses = [
   { name: 'write_file', args: { path: 'target.txt', content: 'verified result\n', expectedContent: 'before\n' } },
   { name: 'outcome', args: { kind: 'complete', summary: 'Updated target.txt; independent comparison is ready.' } },
 ];
+const acceptanceResponseCount = responses.length;
+const conversationObjective = 'Explain the current value in target.txt.';
+const conversationReply = 'The value in target.txt is before.';
+const conversationDraft = {
+  sequence: 1, summary: 'Read the current value and explain it', observations: [],
+  nodes: [{ id: 'answer', title: 'Explain the current value', goal: conversationObjective, dependsOn: [], kind: 'research', inputs: ['target.txt'], outputs: ['Explanation'], checkIds: [] }],
+};
+responses.push(
+  { name: 'read_file', args: { path: 'target.txt' }, text: 'Inspecting the current value before planning.' },
+  { name: 'update_plan', args: { draft: conversationDraft, submit: true }, text: 'I will read the value and explain it.' },
+  { name: 'read_file', args: { path: 'target.txt' } },
+  { name: 'outcome', args: { kind: 'complete', summary: conversationReply } },
+  { name: 'update_plan', args: { draft: { ...conversationDraft, summary: 'Answer the follow-up using the earlier conversation' }, submit: true } },
+  { name: 'outcome', args: { kind: 'complete', summary: 'The value I read was before. I kept the file unchanged.' } },
+);
 const requests = [];
 let application;
 let snapshot;
@@ -161,7 +176,7 @@ try {
   assert.ok(snapshot.artifacts.some(artifact => artifact.content.includes('verified result')));
   assert.deepEqual(snapshot.events.map(event => event.seq), Array.from({ length: snapshot.events.length }, (_, index) => index + 1));
   if (!live) {
-    assert.equal(requests.length, responses.length);
+    assert.equal(requests.length, acceptanceResponseCount);
     assert.deepEqual(snapshot.actions.filter(action => action.name === 'write_file').map(action => action.status), ['failed', 'succeeded']);
     assert.equal(await readFile(join(snapshot.task.workdir, 'contract.txt'), 'utf8'), 'fixed contract\n');
     assert.ok(snapshot.checks.every(check => check.taskRevision === 2 && check.planId === snapshot.task.activePlanId));
@@ -171,9 +186,52 @@ try {
   const report = await command({ type: 'task.export', taskId });
   assert.match(await readFile(report.path, 'utf8'), /Status: completed/);
   if (!live) assert.match(await readFile(report.path, 'utf8'), /## Task revisions[\s\S]+Compare the result[\s\S]+Compare the revised result/);
+  if (!live) {
+    await page.getByRole('button', { name: 'New task', exact: true }).click();
+    await expect(page.getByRole('heading', { name: 'New conversation', exact: true })).toBeVisible();
+    await page.getByRole('textbox', { name: 'Message', exact: true }).fill(conversationObjective);
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    let conversation;
+    await expect.poll(async () => {
+      const created = (await command({ type: 'bootstrap' })).tasks.find(task => task.interaction === 'conversation');
+      if (!created) return undefined;
+      conversation = await command({ type: 'task.snapshot', taskId: created.id });
+      return conversation.task.status;
+    }, { timeout: 45000 }).toBe('idle');
+    assert.equal(conversation.task.acceptedDigest, undefined);
+    assert.ok(conversation.nodes.every(node => node.status === 'finished'));
+    assert.equal(conversation.decisions.length, 0);
+    const conversationId = conversation.task.id, workdir = conversation.task.workdir;
+    await expect(page.locator('.conversation')).toContainText(conversationReply);
+    const followup = 'What value did you just read? Keep the file unchanged.';
+    await page.getByRole('textbox', { name: 'Message…', exact: true }).fill(followup);
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect.poll(async () => {
+      conversation = await command({ type: 'task.snapshot', taskId: conversationId });
+      return [conversation.task.status, conversation.task.revision];
+    }, { timeout: 45000 }).toEqual(['idle', 2]);
+    assert.equal(conversation.task.workdir, workdir);
+    assert.equal(conversation.plans.length, 2);
+    assert.equal(conversation.events.filter(event => event.kind === 'user.message').length, 1);
+    assert.equal(conversation.events.filter(event => event.kind === 'assistant.response').length, 2);
+    assert.equal(conversation.actions.some(action => ['write_file', 'edit_file', 'run_command'].includes(action.name)), false);
+    assert.equal(await readFile(join(workdir, 'target.txt'), 'utf8'), 'before\n');
+    assert.equal(conversation.task.acceptedDigest, undefined);
+    assert.equal(conversation.decisions.length, 0);
+    const followupPayload = JSON.stringify(requests[acceptanceResponseCount + 4].messages);
+    assert.ok(followupPayload.includes(conversationObjective));
+    assert.ok(followupPayload.includes(conversationReply));
+    assert.ok(followupPayload.includes(followup));
+    await expect(page.locator('.conversation')).toContainText('The value I read was before. I kept the file unchanged.');
+    await expect(page.locator('.conversation [data-event-kind="assistant.response"]').last()).toBeInViewport();
+    await expect(page.getByRole('dialog', { name: 'Review impact', exact: true })).toHaveCount(0);
+    const chatReport = await command({ type: 'task.export', taskId: conversationId });
+    assert.match(await readFile(chatReport.path, 'utf8'), /user\.message[\s\S]+The value I read was before/);
+    assert.equal(requests.length, responses.length);
+  }
   assert.deepEqual(errors, [], 'Renderer should not have console or page errors');
   if (process.env.KNOTRAIL_SMOKE_SCREENSHOT) await page.screenshot({ path: process.env.KNOTRAIL_SMOKE_SCREENSHOT });
-  console.log(JSON.stringify({ result: 'passed', packaged: !!process.env.KNOTRAIL_ELECTRON_EXECUTABLE, model: live ? modelId : 'scripted loopback provider through real pi SDK', authSource: live ? 'codex-login' : 'api-key', planningBeforeExecution: true, verifiedChecks: snapshot.checks.length, rightPlanningPanel: true, planTracker: true, languages: ['en', 'zh-CN'], isolatedWorktree: true, encryptedCredentialStorage: true, credentialReadbackRedacted: true, rendererErrors: errors.length, ...(live ? { providerRetries: snapshot.events.filter(event => event.kind === 'provider.retry').length, usage: snapshot.runs.map(run => run.usage) } : { acceptanceRevision: true, revisedProtectionEnforced: true }) }));
+  console.log(JSON.stringify({ result: 'passed', packaged: !!process.env.KNOTRAIL_ELECTRON_EXECUTABLE, model: live ? modelId : 'scripted loopback provider through real pi SDK', authSource: live ? 'codex-login' : 'api-key', planningBeforeExecution: true, verifiedChecks: snapshot.checks.length, rightPlanningPanel: true, planTracker: true, languages: ['en', 'zh-CN'], isolatedWorktree: true, encryptedCredentialStorage: true, credentialReadbackRedacted: true, rendererErrors: errors.length, ...(live ? { providerRetries: snapshot.events.filter(event => event.kind === 'provider.retry').length, usage: snapshot.runs.map(run => run.usage) } : { acceptanceRevision: true, revisedProtectionEnforced: true, quickConversation: true, followupContext: true }) }));
 } catch (error) {
   console.error(JSON.stringify({ lastStatus: snapshot?.task.status, lastError: snapshot?.task.error, lastEvents: snapshot?.events.slice(-5).map(event => ({ kind: event.kind, text: event.text })), providerRequests: requests.length, hostOutput: live ? undefined : hostOutput, rendererErrors: errors }));
   throw error;

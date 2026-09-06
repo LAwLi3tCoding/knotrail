@@ -1,6 +1,9 @@
 import type { Locale } from '../shared/contracts';
 
 const zh = {
+  'Prepared file change': '写入前保存的预期变更',
+  'File postcondition observed': '已查证文件后置状态',
+  'The file matched the prepared result at this time. The earlier operation remains unknown; continuation uses a fresh plan.': '文件在所示时间与预期结果一致。此前操作的结果仍未知，继续时会重新规划。',
   'Output limits follow the Codex service. Task turn and time budgets still apply.': '输出上限由 Codex 服务决定；任务的轮次和时长预算仍然有效。',
   'Authentication': '认证方式', 'API key or local endpoint': 'API key 或本地服务', 'Existing Codex login': '已有 Codex 登录', 'Check saved login': '检查已保存的登录方式',
   'Uses your existing local Codex sign-in. Sign in with Codex first; each run reads the current login.': '使用本机已有的 Codex 登录。请先登录 Codex；每次运行都会读取当前登录状态。',

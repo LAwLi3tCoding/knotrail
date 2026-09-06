@@ -3,7 +3,9 @@ import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { StringDecoder } from 'node:string_decoder';
 import type { ToolCall } from '../runtime/contracts.js';
+import type { FileMutationIntent } from '../shared/contracts.js';
 import type { ExecutionResult, Executor, SandboxOptions } from './contracts.js';
 
 export function sandboxCapability(): { sandbox: boolean; reason?: string; platform: string } {
@@ -12,6 +14,18 @@ export function sandboxCapability(): { sandbox: boolean; reason?: string; platfo
   return { sandbox: probe.status === 0, platform: process.platform, ...(probe.status === 0 ? {} : { reason: 'macOS sandbox-exec is unavailable or denied by the enclosing environment' }) };
 }
 const quote = (value: string) => JSON.stringify(value);
+const object = (value: unknown): value is Record<string, unknown> => !!value && typeof value === 'object' && !Array.isArray(value);
+const digest = (value: unknown) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+const mode = (value: unknown) => Number.isInteger(value) && Number(value) >= 0 && Number(value) <= 0o777;
+function fileIntent(value: unknown): value is FileMutationIntent {
+  if (!object(value) || Object.keys(value).some(key => !['id', 'path', 'before', 'after'].includes(key)) || typeof value.id !== 'string' || !value.id.length || value.id.length > 128 || typeof value.path !== 'string' || !value.path.length || value.path.length > 4096 || value.path.includes('\0') || isAbsolute(value.path)) return false;
+  const { before, after } = value;
+  if (!object(before) || !object(after) || Object.keys(before).some(key => !['exists', 'sourceDigest', 'mode'].includes(key)) || Object.keys(after).some(key => !['exists', 'sourceDigest', 'mode'].includes(key))) return false;
+  return (before.exists === true ? digest(before.sourceDigest) && mode(before.mode) : before.exists === false && before.sourceDigest === null && before.mode === undefined) && after.exists === true && digest(after.sourceDigest) && mode(after.mode);
+}
+function executionResult(value: unknown): value is ExecutionResult {
+  return object(value) && typeof value.text === 'string' && (value.isError === undefined || typeof value.isError === 'boolean') && (value.truncated === undefined || typeof value.truncated === 'boolean') && (value.exitCode === undefined || Number.isInteger(value.exitCode));
+}
 function profile(workdir: string, temp: string, helper: string, protectedPaths: string[], network: boolean): string {
   const executable = realpathSync(process.execPath);
   const reads = ['/System', '/usr', '/bin', '/sbin', '/Library/Apple', '/opt/homebrew/Cellar', '/opt/homebrew/opt', '/opt/homebrew/bin', '/opt/homebrew/lib', '/usr/local/lib', '/private/var/db/dyld', dirname(executable), workdir, temp];
@@ -46,7 +60,7 @@ export class SandboxExecutor implements Executor {
     });
     let result: ExecutionResult | undefined, stderr = '', cancelled = false, settled = false;
     return new Promise((resolveResult, reject) => {
-      let terminationSubmitted = false, childClosed = false;
+      let terminationSubmitted = false, childClosed = false, intentSeen = false, intentPending = false, intentAcknowledged = false, protocolFailed = false;
       let terminationError: unknown;
       let closeCode: number | null = null, closeSignal: NodeJS.Signals | null = null;
       const maybeFinish = () => {
@@ -67,13 +81,47 @@ export class SandboxExecutor implements Executor {
         maybeFinish();
       };
       const abort = () => { cancelled = true; killGroup(); };
+      const fail = (error: unknown) => { protocolFailed = true; terminationError ??= error; killGroup(); };
       const timer = setTimeout(abort, options.timeoutMs);
       signal.addEventListener('abort', abort, { once: true });
       child.stderr?.on('data', chunk => { stderr = (stderr + chunk.toString()).slice(-8_000); });
-      let protocol = '';
-      child.stdout?.on('data', chunk => { protocol += chunk.toString(); const end = protocol.indexOf('\n'); if (end >= 0) { try { result = JSON.parse(protocol.slice(0, end)) as ExecutionResult; } catch { result = { text: 'Invalid sandbox helper response', isError: true }; } killGroup(); } });
-      child.stdin?.on('error', () => {});
-      child.stdin?.write(JSON.stringify({ call, workdir, temp, protectedPaths: options.protectedPaths, timeoutMs: options.timeoutMs }) + '\n');
+      const stopping = () => cancelled || protocolFailed || terminationSubmitted || childClosed || settled;
+      const fileCall = call.name === 'write_file' || call.name === 'edit_file';
+      const frame = (value: unknown) => {
+        if (!object(value) || result) { fail(new Error('Invalid or duplicate sandbox helper response')); return; }
+        if (value.kind === 'file_intent') {
+          if (!fileCall || !options.onFileIntent || intentSeen || Object.keys(value).length !== 2 || !fileIntent(value.intent) || typeof call.args.path !== 'string' || resolve(workdir, value.intent.path) !== resolve(workdir, call.args.path)) { fail(new Error('Invalid or unexpected file mutation intent')); return; }
+          const intent = value.intent, id = intent.id;
+          intentSeen = true; intentPending = true;
+          void Promise.resolve().then(async () => {
+            if (stopping()) return;
+            await options.onFileIntent!(intent);
+            intentPending = false;
+            if (stopping()) return;
+            intentAcknowledged = true;
+            child.stdin!.write(JSON.stringify({ kind: 'file_intent_ack', id }) + '\n', error => { if (error && !stopping()) fail(error); });
+          }).catch(error => { intentPending = false; if (!settled) fail(error); });
+        } else if (value.kind === 'result' && Object.keys(value).length === 2 && executionResult(value.result)) {
+          if (intentPending || (fileCall && options.onFileIntent && !intentAcknowledged && !value.result.isError)) { fail(new Error('Sandbox helper finished before file intent acknowledgement')); return; }
+          result = value.result; killGroup();
+        } else fail(new Error('Invalid sandbox helper response'));
+      };
+      let protocol = '', protocolBytes = 0;
+      const decoder = new StringDecoder('utf8');
+      child.stdout?.on('data', (chunk: Buffer) => {
+        if (cancelled || protocolFailed) { killGroup(); return; }
+        protocolBytes += chunk.length;
+        if (protocolBytes > 1024 * 1024) { fail(new Error('Sandbox helper response exceeds protocol limit')); return; }
+        protocol += decoder.write(chunk);
+        for (let end = protocol.indexOf('\n'); end >= 0; end = protocol.indexOf('\n')) {
+          const line = protocol.slice(0, end); protocol = protocol.slice(end + 1); protocolBytes = Buffer.byteLength(protocol);
+          try { frame(JSON.parse(line)); } catch { fail(new Error('Invalid sandbox helper response')); }
+          if (protocolFailed) return;
+        }
+      });
+      child.stdin?.on('error', error => { if (!stopping()) fail(error); });
+      if (signal.aborted) abort();
+      if (!cancelled) child.stdin?.write(JSON.stringify({ call, workdir, temp, protectedPaths: options.protectedPaths, timeoutMs: options.timeoutMs, requireFileIntent: !!options.onFileIntent }) + '\n');
       child.once('error', error => { terminationError ??= error; killGroup(); });
       child.once('close', (code, exitSignal) => {
         childClosed = true; closeCode = code; closeSignal = exitSignal;

@@ -7,14 +7,15 @@ import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
 const LIMIT = 64 * 1024;
 const MAX_FILE = 2 * 1024 * 1024;
+const MAX_REQUEST = 40 * 1024 * 1024; // Bounded JSON includes escaped content, expectedContent, and edit strings.
 const skipped = new Set(['.git', 'node_modules', '.next', 'dist', 'release']);
 process.stdin.on('end', () => { try { process.kill(-process.pid, 'SIGKILL'); } catch { process.exit(1); } });
-let request;
+let request, pendingIntent, intentSent = false, protocolFailed = false, resultSent = false;
 const hash = value => createHash('sha256').update(value).digest('hex');
 const contains = (root, path) => path === root || (!relative(root, path).startsWith('..') && !isAbsolute(relative(root, path)));
 function bounded(text, extra = {}) { return { text: text.slice(0, LIMIT), truncated: text.length > LIMIT, ...extra }; }
 async function checkedPath(input = '.', write = false) {
-  if (typeof input !== 'string' || input.includes('\0') || isAbsolute(input)) throw new Error('Expected a relative workspace path');
+  if (typeof input !== 'string' || !input.isWellFormed() || input.includes('\0') || isAbsolute(input)) throw new Error('Expected a relative workspace path');
   const path = resolve(request.workdir, input);
   if (!contains(request.workdir, path)) throw new Error('Path escapes the worktree');
   const parts = relative(request.workdir, path).split('/');
@@ -29,21 +30,22 @@ async function checkedPath(input = '.', write = false) {
   }
   return path;
 }
-async function currentFile(path) {
-  try {
-    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+async function fileSnapshot(path) {
+  let handle;
+  try { handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+  catch (error) { if (error.code === 'ENOENT') return null; throw error; }
     try {
       const stat = await handle.stat();
       if (!stat.isFile() || stat.size > MAX_FILE) throw new Error('Expected a regular text file no larger than 2 MiB');
       const buffer = Buffer.alloc(stat.size + 1);let size=0,count=0;
       do {({bytesRead:count}=await handle.read(buffer,size,buffer.length-size,null));size+=count;}while(count&&size<buffer.length);
-      const after=await handle.stat();
-      if(size!==stat.size||after.size!==size||after.mtimeMs!==stat.mtimeMs||after.ctimeMs!==stat.ctimeMs)throw new Error('File changed during read');
+      const after=await handle.stat(), current=await lstat(path);
+      if(size!==stat.size||after.size!==size||after.mtimeMs!==stat.mtimeMs||after.ctimeMs!==stat.ctimeMs||current.dev!==stat.dev||current.ino!==stat.ino||current.ctimeMs!==after.ctimeMs)throw new Error('File changed during read');
       if (buffer.subarray(0,size).includes(0)) throw new Error('Binary files are not supported');
-      return new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(buffer.subarray(0,size));
+      return { content: new TextDecoder('utf-8',{fatal:true,ignoreBOM:true}).decode(buffer.subarray(0,size)), sourceDigest: hash(buffer.subarray(0,size)), mode: after.mode & 0o777 };
     } finally { await handle.close(); }
-  } catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
+async function currentFile(path) { return (await fileSnapshot(path))?.content ?? null; }
 async function files(root, result = []) {
   for (const entry of await readdir(root, { withFileTypes: true })) {
     if (skipped.has(entry.name) || entry.isSymbolicLink()) continue;
@@ -61,18 +63,34 @@ function checkExpected(value, expected, expectedHash) {
   return (expected === undefined || value === expected) && (expectedHash === undefined || (value !== null && hash(value) === expectedHash));
 }
 async function replace(path, expected, content, expectedHash) {
-  if (typeof content !== 'string' || Buffer.byteLength(content) > MAX_FILE) throw new Error('Content must be text no larger than 2 MiB');
-  const before = await currentFile(path);
-  if (!checkExpected(before, expected, expectedHash)) throw new Error('File changed: expectedContent does not match. Read it again before editing.');
+  if (typeof content !== 'string' || !content.isWellFormed() || content.includes('\0') || Buffer.byteLength(content) > MAX_FILE) throw new Error('Content must be valid UTF-8 text without NUL, no larger than 2 MiB');
+  const before = await fileSnapshot(path), bytes = Buffer.from(content, 'utf8');
+  if (!checkExpected(before?.content ?? null, expected, expectedHash)) throw new Error('File changed: expectedContent does not match. Read it again before editing.');
+  const mode = before === null ? 0o644 & ~process.umask() : before.mode;
+  const intent = { id: randomUUID(), path: relative(request.workdir, path), before: before ? { exists: true, sourceDigest: before.sourceDigest, mode: before.mode } : { exists: false, sourceDigest: null }, after: { exists: true, sourceDigest: hash(bytes), mode } };
+  if (request.requireFileIntent) {
+    if (intentSent) throw new Error('Duplicate file mutation intent');
+    intentSent = true;
+    await new Promise((resolveIntent, rejectIntent) => {
+      pendingIntent = { id: intent.id, resolve: resolveIntent, reject: rejectIntent };
+      send({ kind: 'file_intent', intent }, error => { if (error) failProtocol(error); });
+    });
+  }
+  const checkBefore = async () => {
+    if (protocolFailed) throw new Error('File intent protocol failed');
+    await checkedPath(intent.path, true);
+    const current = await fileSnapshot(path);
+    if (!checkExpected(current?.content ?? null, expected, expectedHash) || current?.sourceDigest !== before?.sourceDigest || current?.mode !== before?.mode) throw new Error('Concurrent modification detected before replacement');
+  };
+  // No directory, temporary file, or write is created before the durable intent acknowledgement.
+  await checkBefore();
   await mkdir(dirname(path), { recursive: true });
-  await checkedPath(relative(request.workdir, path), true);
+  await checkBefore();
   const temp = join(dirname(path), `.knotrail-${randomUUID()}.tmp`);
-  const mode = before === null ? 0o644 : (await lstat(path)).mode & 0o777;
-  const handle = await open(temp, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, mode);
+  const handle = await open(temp, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
   try {
-    await handle.writeFile(content, 'utf8'); await handle.sync(); await handle.close();
-    await checkedPath(relative(request.workdir, path), true);
-    if (!checkExpected(await currentFile(path), expected, expectedHash)) throw new Error('Concurrent modification detected before replacement');
+    await handle.writeFile(bytes); await handle.chmod(mode); await handle.sync(); await handle.close();
+    await checkBefore();
     await rename(temp, path);
   } finally { await handle.close().catch(() => {}); await unlink(temp).catch(() => {}); }
   return bounded(`Updated ${relative(request.workdir, path)}\nsha256: ${hash(content)}`);
@@ -90,7 +108,7 @@ async function execute(call) {
     command.stdout.on('data', append); command.stderr.on('data', append);
     return await new Promise(resolveResult => {
       const timer = setTimeout(() => {
-        send({ text: output + '\nCommand timed out', isError: true, truncated }, () => { try { process.kill(-process.pid, 'SIGKILL'); } catch {} });
+        sendResult({ text: output + '\nCommand timed out', isError: true, truncated }, () => { try { process.kill(-process.pid, 'SIGKILL'); } catch {} });
       }, Math.min(request.timeoutMs, requestedTimeout));
       command.once('error', error => { clearTimeout(timer); resolveResult(bounded(error.message, { isError: true })); });
       // Use exit, not close: background descendants may inherit stdout. Parent kills the group before resolving.
@@ -120,15 +138,36 @@ async function execute(call) {
   const value = await currentFile(path);
   if (value === null || !checkExpected(value, args.expectedContent, args.expectedHash)) throw new Error('File changed: expectedContent does not match');
   if (value.split(args.oldText).length !== 2) throw new Error('oldText must occur exactly once');
-  return replace(path, args.expectedContent, value.replace(args.oldText, args.newText), args.expectedHash);
+  return replace(path, args.expectedContent, value.replace(args.oldText, () => args.newText), args.expectedHash);
 }
 function send(value, callback) { process.stdout.write(JSON.stringify(value) + '\n', callback); }
-let input = '';
-process.stdin.on('data', async chunk => {
-  if (request) return;
-  input += chunk.toString();
-  const end = input.indexOf('\n'); if (end < 0) return;
-  try { request = JSON.parse(input.slice(0, end)); send(await execute(request.call)); }
-  catch (error) { send(bounded(error.message || String(error), { isError: true })); }
+function sendResult(result, callback) { if (!resultSent) { resultSent = true; send({ kind: 'result', result }, callback); } }
+function failProtocol(error) {
+  protocolFailed = true;
+  pendingIntent?.reject(error); pendingIntent = undefined;
+  sendResult(bounded(error.message || String(error), { isError: true }));
+}
+let input = [], inputBytes = 0;
+process.stdin.on('data', chunk => {
+  if (protocolFailed) return;
+  for (let start = 0; start < chunk.length;) {
+    const end = chunk.indexOf(10, start), part = chunk.subarray(start, end < 0 ? chunk.length : end);
+    inputBytes += part.length;
+    if (inputBytes > (request ? 4096 : MAX_REQUEST)) { failProtocol(new Error('Sandbox request exceeds protocol limit')); return; }
+    input.push(part); start = end < 0 ? chunk.length : end + 1;
+    if (end < 0) break;
+    let value;
+    try { value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(input, inputBytes))); }
+    catch { failProtocol(new Error('Invalid sandbox request')); return; }
+    input = []; inputBytes = 0;
+    if (!request) {
+      if (!value || typeof value !== 'object' || !value.call) { failProtocol(new Error('Invalid sandbox request')); return; }
+      request = value;
+      void execute(request.call).then(result => sendResult(result), error => sendResult(bounded(error.message || String(error), { isError: true })));
+    } else {
+      if (resultSent || !pendingIntent || value?.kind !== 'file_intent_ack' || value.id !== pendingIntent.id || Object.keys(value).length !== 2) { failProtocol(new Error('Invalid or unexpected file intent acknowledgement')); return; }
+      const pending = pendingIntent; pendingIntent = undefined; pending.resolve();
+    }
+  }
   // Keep ownership fd and stdin alive until the parent kills the entire group.
 });

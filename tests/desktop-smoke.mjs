@@ -2,7 +2,7 @@
 // Default: scripted loopback. KNOTRAIL_AUTH_SOURCE=codex-login opts into the user's real subscription.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -187,6 +187,9 @@ try {
     assert.ok(JSON.stringify(requests[9].messages).includes(artifact.id));assert.ok(JSON.stringify(requests[9].messages).includes('verified result'));
     assert.equal(snapshot.actions.find(a=>a.name==='read_input').status,'succeeded');
     assert.deepEqual(snapshot.actions.filter(action => action.name === 'write_file').map(action => action.status), ['failed', 'succeeded']);
+    const written=snapshot.actions.find(action=>action.name==='write_file'&&action.status==='succeeded');
+    assert.equal(written.fileIntent.path,'target.txt');assert.equal(written.fileIntent.before.sourceDigest,createHash('sha256').update('before\n').digest('hex'));assert.equal(written.fileIntent.after.sourceDigest,artifact.source.sourceDigest);assert.equal(written.fileIntent.sourceIdentity,artifact.source.sourceIdentity);assert.equal(written.filePostcondition,undefined);
+    assert.ok(snapshot.events.some(event=>event.kind==='file.intent'&&event.data.actionId===written.id));
     assert.equal(await readFile(join(snapshot.task.workdir, 'contract.txt'), 'utf8'), 'fixed contract\n');
     assert.ok(snapshot.checks.every(check => check.taskRevision === 2 && check.planId === snapshot.task.activePlanId));
   }

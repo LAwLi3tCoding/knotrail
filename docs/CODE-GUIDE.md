@@ -189,7 +189,13 @@ Worker 使用已固定版本的 `@earendil-works/pi-coding-agent`。项目和全
 
 恢复卡片是 `Decision.kind=recovery`，绑定 actionIds、actionsDigest、workspaceDigest 和证据 artifactId，Task/Plan 版本由 Decision 绑定。`decision.answer` 复核后，在一个事务中保存 resolution、回答和 requestId。保留并重新规划会创建新 TaskRevision；终态的 preserve-and-stop 只保存处置、保持终态。原 action.status 仍是 unknown。处置失败或证据变化不能解锁效果。
 
-acceptance、model、recovery 使用显式 kind 分派，模型不能用问题文本伪装成宿主验收。当前恢复仍依赖用户查证；没有从 diff 推断命令未发生，也没有通用 exactly-once 保证。
+acceptance、model、recovery 使用显式 kind 分派，模型不能用问题文本伪装成宿主验收。命令和无法证明后置状态的文件操作仍依赖用户查证；没有从 diff 推断命令未发生，也没有通用 exactly-once 保证。
+
+文件操作调用链是 `executeRecorded → SandboxExecutor → helper file_intent → prepareFileEffect → Store.update(COMMIT) → file_intent_ack → replace → result → receipt`。NDJSON 的意图与最终结果是不同消息，重复意图、异常帧和 callback 保存失败会终止并等待 helper 收尾。没有 ACK 时，helper 不创建目标父目录或写入替换文件。edit_file 将 newText 作为字面文本，不展开 JavaScript 替换模板。
+
+`prepareFileEffect()` 用严格 schema、原始 args 的路径/前置条件/预期输出、Run 与 Plan 身份、实际文件快照交叉校验；保存 `ActionReceipt.fileIntent` 和 sourceIdentity 后才返回。`task.resume`、`task.inspectEffects` 在 stop 后调用 `inspectFileEffects()`：无活动 Run、无未知命令时重读文件，并在同一事务中再次复核，保存 `filePostcondition`、清除旧计划资格及旧待答决定。保留 TaskRevision，下一次运行创建新 Plan。`unresolved()` 排除已人工处置或已查证后置状态的历史记录；action.status 继续 unknown。已记录的后置状态是观察时刻的事实，后续仍须读取和验证当前文件。
+
+`tests/file-recovery.test.ts` 使用真实宿主、SQLite、owner 锁和 sandbox helper，分别在意图持久后未 ACK、真实写入收尾后未存回执两个窗口强杀宿主。第三个无操作写入在 ACK 前强杀，验证文件状态吻合不会伪造成功回执。这些实验不覆盖断电、磁盘满或脱离进程组的后代。
 
 `task.previewRevision` 与 `ImpactPreview` 的 checks 使用相同 CheckSpec 校验：最多 30 项、ID 唯一、argv 为字符串数组、保护路径不得越界。省略字段与空数组含义不同；维护任务拒绝空检查。`dispatch()` 的 `task.applyImpact` 分支校验数据库中签发的完整预览，并重新核对 TaskRevision、Plan、工作区摘要及 inputSourcesDigest。后者覆盖声明文件和本版实际读取，包含工作区摘要忽略的依赖目录；来源不可读取时记录不可用状态，执行绑定仍须成功。确认后同时更新 Task.checks 与 revisionHistory，清除当前完成资格和旧待答决定，重新进入 planning；新 Planner 不能遗漏用户检查。
 

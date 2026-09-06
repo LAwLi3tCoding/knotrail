@@ -802,3 +802,81 @@ test('a declared workspace-file wait re-evaluates nodes on its new observed sour
  writeFileSync(join(waiting.task.workdir,'sample.txt'),'external result\n');due(app,created.task.id);
  const done=await until(app,created.task.id,s=>['completed','blocked'].includes(s.task.status));assert.equal(done.task.status,'completed',done.task.error);assert.equal(done.nodes[0]!.attempt,2);assert.equal(done.runs.at(-1)!.inputBindings![0]!.content,'external result\n');assert.ok(done.events.some(e=>e.kind==='evidence.stale'));assert.ok(done.task.acceptedDigest);assert.equal(done.artifacts.find(a=>a.outputId==='summary')!.content,'external result\n');assert.equal(readFileSync(join(done.task.workdir,'sample.txt'),'utf8'),'external result\n');
 });
+
+// These tests exercise the durable callback, not a claimed success response from the tool.
+const fileIntentExecutor:Executor={async execute(call,options,signal){
+ if(call.name==='write_file'){
+  const before=readFileSnapshot(options.workdir,String(call.args.path)).source;
+  await options.onFileIntent!({id:id(),path:before.path,before:{exists:before.exists,sourceDigest:before.sourceDigest,...(before.exists?{mode:before.mode!}:{})},after:{exists:true,sourceDigest:createHash('sha256').update(String(call.args.content)).digest('hex'),mode:before.mode??0o644}});
+ }
+ return executor.execute(call,options,signal);
+}};
+function fileRecoveryRunner():Runner {
+ return {async run(r,c,signal){
+  if(r.purpose==='planning')await c.onControl({kind:'update_plan',draft,submit:true});
+  else {if(r.node?.id==='edit')await c.onTool({toolCallId:id(),name:'write_file',args:{path:'sample.txt',content:'updated\n',expectedContent:'original\n'}});await c.onControl({kind:'complete',summary:'Updated'});}
+  return {summary:'file recovery fixture',turns:1,aborted:signal.aborted};
+ }};
+}
+async function lostFileReceipt(t:test.TestContext){
+ const f=await setup(t,fileRecoveryRunner());(f.app as any).executor=fileIntentExecutor;
+ const put=f.app.store.put.bind(f.app.store);let injected=false;
+ f.app.store.put=s=>{if(!injected&&s.actions.some(a=>a.fileIntent&&a.status==='succeeded')){injected=true;throw new Error('Receipt commit interrupted');}put(s);};
+ const created=await f.app.command(create(f.project)) as TaskSnapshot;await until(f.app,created.task.id,s=>s.task.status==='ready');
+ await f.app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const blocked=await until(f.app,created.task.id,s=>s.task.status==='blocked');
+ assert.equal(blocked.actions[0]!.status,'unknown');assert.ok(blocked.actions[0]!.fileIntent);assert.equal(readFileSync(join(blocked.task.workdir,'sample.txt'),'utf8'),'updated\n');
+ return {...f,blocked};
+}
+test('a durable file intent precedes effects; postcondition recovery keeps unknown history and creates a fresh plan',async t=>{
+ const {app,blocked}=await lostFileReceipt(t);const oldPlan=blocked.plan!.id;
+ const resumed=await app.command({type:'task.resume',taskId:blocked.task.id,expectedRevision:1}) as TaskSnapshot;
+ assert.equal(resumed.task.acceptedDigest,undefined);
+ const ready=await until(app,blocked.task.id,s=>s.task.status==='ready');
+ assert.notEqual(ready.plan!.id,oldPlan);assert.equal(ready.plans.length,2);assert.equal(ready.actions.length,1,'Recovery must not replay the old tool call');
+ assert.equal(ready.actions[0]!.status,'unknown');assert.ok(ready.actions[0]!.filePostcondition);assert.equal(ready.actions[0]!.resolution,undefined);
+ assert.equal(ready.decisions.filter(d=>!d.answer).length,0);assert.equal(ready.runs.length,3);
+ assert.equal(readFileSync(join(ready.task.workdir,'sample.txt'),'utf8'),'updated\n');assert.match(app.report(ready.task.id),/filePostcondition/);
+});
+test('intent persistence failure prevents the file mutation',async t=>{
+ const {app,project}=await setup(t,fileRecoveryRunner());(app as any).executor=fileIntentExecutor;
+ const put=app.store.put.bind(app.store);app.store.put=s=>{if(s.actions.some(a=>a.fileIntent))throw new Error('Intent disk write failed');put(s);};
+ const created=await app.command(create(project,{executionPolicy:'autoWithinGrant'})) as TaskSnapshot;const blocked=await until(app,created.task.id,s=>s.task.status==='blocked');
+ assert.equal(readFileSync(join(blocked.task.workdir,'sample.txt'),'utf8'),'original\n');assert.equal(blocked.actions[0]!.fileIntent,undefined);
+});
+test('file recovery does not infer an outcome from old bytes, different modes or replaced workspace identity',async t=>{
+ for(const change of ['old-bytes','mode','root']){
+  const {app,blocked}=await lostFileReceipt(t);const path=join(blocked.task.workdir,'sample.txt');
+  if(change==='old-bytes')writeFileSync(path,'original\n');
+  if(change==='mode')chmodSync(path,0o600);
+  if(change==='root'){renameSync(blocked.task.workdir,blocked.task.workdir+'-old');mkdirSync(blocked.task.workdir);writeFileSync(path,'updated\n');writeFileSync(join(blocked.task.workdir,'check.mjs'),'// immutable acceptance script\n');}
+  if(change==='root')await assert.rejects(app.command({type:'task.inspectEffects',taskId:blocked.task.id}));
+  else await app.command({type:'task.resume',taskId:blocked.task.id,expectedRevision:1});
+  const after=app.store.get(blocked.task.id);assert.equal(after.actions[0]!.filePostcondition,undefined);assert.equal(after.runs.length,2);assert.equal(after.actions[0]!.status,'unknown');
+ }
+});
+test('postcondition commit failure keeps recovery frozen; successful inspection never revives a cancelled task',async t=>{
+ const {app,blocked}=await lostFileReceipt(t);const put=app.store.put.bind(app.store);let fail=true;
+ app.store.put=s=>{if(fail&&s.actions.some(a=>a.filePostcondition))throw new Error('Proof disk write failed');put(s);};
+ await assert.rejects(app.command({type:'task.resume',taskId:blocked.task.id,expectedRevision:1}),/Proof disk write failed/);
+ assert.equal(app.store.get(blocked.task.id).actions[0]!.filePostcondition,undefined);
+ fail=false;await app.command({type:'task.cancel',taskId:blocked.task.id,expectedRevision:1});
+ const after=await app.command({type:'task.inspectEffects',taskId:blocked.task.id}) as TaskSnapshot;
+ assert.equal(after.task.status,'cancelled');assert.equal(after.runs.length,2);assert.ok(after.actions[0]!.filePostcondition);assert.equal(after.actions[0]!.status,'unknown');
+});
+test('unknown commands prevent automatic file reconciliation across tasks',async t=>{
+ const {app,project,blocked}=await lostFileReceipt(t);
+ const other=await app.command(create(project)) as TaskSnapshot;await until(app,other.task.id,s=>s.task.status==='ready');uncertainAction(app,other.task.id,'run_command');
+ await app.command({type:'task.resume',taskId:blocked.task.id,expectedRevision:1});
+ assert.equal(app.store.get(blocked.task.id).actions[0]!.filePostcondition,undefined);assert.equal(app.store.get(blocked.task.id).runs.length,2);
+});
+test('file intent validates original path, raw preimage, expected output and operation identity before acknowledgement',async t=>{
+ for(const corruption of ['path','preimage','output','duplicate']){
+  const {app,project}=await setup(t,fileRecoveryRunner());let effects=0;
+  (app as any).executor={async execute(call:Parameters<Executor['execute']>[0],options:Parameters<Executor['execute']>[1]){
+   const before=readFileSnapshot(options.workdir,'sample.txt').source,intent={id:id(),path:corruption==='path'?'other.txt':'sample.txt',before:{exists:true,sourceDigest:corruption==='preimage'?'f'.repeat(64):before.sourceDigest,mode:before.mode!},after:{exists:true as const,sourceDigest:createHash('sha256').update(corruption==='output'?'bad':'updated\n').digest('hex'),mode:before.mode!}};
+   await options.onFileIntent!(intent);if(corruption==='duplicate')await options.onFileIntent!(intent);effects++;return {text:'not reached'};
+  }};
+  const created=await app.command(create(project,{executionPolicy:'autoWithinGrant'})) as TaskSnapshot;const blocked=await until(app,created.task.id,s=>s.task.status==='blocked');
+  assert.equal(effects,0);assert.equal(readFileSync(join(blocked.task.workdir,'sample.txt'),'utf8'),'original\n');
+ }
+});

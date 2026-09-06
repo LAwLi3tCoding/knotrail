@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import childProcess, { spawn, type SpawnOptions } from 'node:child_process';
 import { lookup } from 'node:dns/promises';
-import { chmod, mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -11,8 +12,15 @@ import { SandboxExecutor, sandboxCapability } from '../src/execution/sandbox.js'
 import { acquireOwnerLock } from '../src/execution/lock.js';
 import type { SandboxOptions } from '../src/execution/contracts.js';
 import type { ToolCall } from '../src/runtime/contracts.js';
+import type { FileMutationIntent } from '../src/shared/contracts.js';
 
 const capability = sandboxCapability();
+const sha256 = (content: string) => createHash('sha256').update(Buffer.from(content, 'utf8')).digest('hex');
+function deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
 async function fixture(t: { after(fn: () => Promise<void>): void }) {
   const root = await mkdtemp(join(tmpdir(), 'knotrail-sandbox-test-'));
   const workdir = join(root, 'work'); const dataDir = join(root, 'data'); await mkdir(workdir); await mkdir(dataDir);
@@ -189,4 +197,122 @@ test('sandbox read metadata hashes original UTF-8 bytes and never reports a trun
  const full=await f.run('read_file',{path:'utf8.txt'});assert.equal(full.isError,undefined);assert.deepEqual(full.source,{path:'utf8.txt',sourceDigest:createHash('sha256').update(Buffer.from(content)).digest('hex'),complete:true});assert.ok(full.text.endsWith(content));
  const long='a'.repeat(70000);await writeFile(join(f.workdir,'long.txt'),long);const partial=await f.run('read_file',{path:'long.txt'});assert.equal(partial.truncated,true);assert.equal(partial.source!.complete,false);assert.equal(partial.source!.sourceDigest,createHash('sha256').update(long).digest('hex'));
  await writeFile(join(f.workdir,'invalid.txt'),Buffer.from([0xc3,0x28]));const invalid=await f.run('read_file',{path:'invalid.txt'});assert.equal(invalid.isError,true);assert.equal(invalid.source,undefined);
+});
+
+test('file intent acknowledgement precedes every directory, temporary file and final write', { skip: !capability.sandbox }, async t => {
+  const f = await fixture(t), prepared = deferred<FileMutationIntent>(), durable = deferred(), controller = new AbortController();
+  f.options.onFileIntent = intent => { prepared.resolve(intent); return durable.promise; };
+  t.after(async () => { controller.abort(); durable.resolve(); });
+  let settled = false;
+  const running = f.run('write_file', { path: 'new/deep/file.txt', expectedContent: null, content: 'first value' }, controller.signal);
+  void running.then(() => { settled = true; }, () => { settled = true; });
+  const intent = await Promise.race([prepared.promise, running.then(() => { throw new Error('Execution finished without preparing an intent'); })]);
+  assert.equal(intent.path, 'new/deep/file.txt');
+  assert.deepEqual(intent.before, { exists: false, sourceDigest: null });
+  assert.equal(intent.after.sourceDigest, sha256('first value'));
+  await delay(80);
+  assert.equal(settled, false, 'Waiting for durable intent storage must keep execution pending');
+  assert.deepEqual(await readdir(f.workdir), [], 'No parent directory or temporary file may be created before acknowledgement');
+  durable.resolve();
+  assert.equal((await running).isError, undefined);
+  assert.equal(await readFile(join(f.workdir, intent.path), 'utf8'), 'first value');
+  assert.equal((await stat(join(f.workdir, intent.path))).mode & 0o777, intent.after.mode);
+});
+
+test('failed intent storage rejects execution and cancellation suppresses a late acknowledgement', { skip: !capability.sandbox }, async t => {
+  const f = await fixture(t), refused = new Error('Intent commit refused');
+  f.options.onFileIntent = () => { throw refused; };
+  await assert.rejects(f.run('write_file', { path: 'refused/file.txt', expectedContent: null, content: 'must not exist' }), error => error === refused);
+  assert.deepEqual(await readdir(f.workdir), []);
+  const prepared = deferred(), durable = deferred(), controller = new AbortController();
+  f.options.onFileIntent = () => { prepared.resolve(); return durable.promise; };
+  const running = f.run('write_file', { path: 'cancelled/file.txt', expectedContent: null, content: 'must not exist' }, controller.signal);
+  t.after(async () => { controller.abort(); durable.resolve(); });
+  await Promise.race([prepared.promise, running.then(() => { throw new Error('Execution finished before preparing'); })]);
+  controller.abort();
+  assert.equal((await running).isError, true);
+  durable.resolve(); await delay(80);
+  assert.deepEqual(await readdir(f.workdir), [], 'A late storage completion must not release an acknowledgement');
+  f.lock.release(); const next = acquireOwnerLock(f.dataDir); next.release();
+});
+
+test('write and literal edit intents witness raw UTF-8 hashes and preserve modes independently of umask', { skip: !capability.sandbox }, async t => {
+  const f = await fixture(t), intents: FileMutationIntent[] = [], originalMask = process.umask();
+  t.after(async () => { process.umask(originalMask); });
+  f.options.onFileIntent = intent => { intents.push(structuredClone(intent)); };
+  process.umask(0);
+  assert.equal((await f.run('write_file', { path: 'normal.txt', expectedContent: null, content: 'default permissions' })).isError, undefined);
+  assert.equal(intents.at(-1)!.after.mode, 0o644, 'The existing 0644 creation baseline must not grant extra write permissions');
+  const original = '\uFEFF中文🧩\n';
+  process.umask(0o077);
+  assert.equal((await f.run('write_file', { path: 'utf8.txt', expectedContent: null, content: original })).isError, undefined);
+  assert.deepEqual(intents.at(-1)!.after, { exists: true, sourceDigest: sha256(original), mode: 0o600 });
+  assert.equal((await stat(join(f.workdir, 'utf8.txt'))).mode & 0o777, 0o600);
+  await chmod(join(f.workdir, 'utf8.txt'), 0o755);
+  const edited = '\uFEFF$& literal replacement\n';
+  const result = await f.run('edit_file', { path: 'utf8.txt', expectedHash: sha256(original), oldText: '中文🧩', newText: '$& literal replacement' });
+  assert.equal(result.isError, undefined, result.text);
+  assert.deepEqual(intents.at(-1)!.before, { exists: true, sourceDigest: sha256(original), mode: 0o755 });
+  assert.deepEqual(intents.at(-1)!.after, { exists: true, sourceDigest: sha256(edited), mode: 0o755 });
+  assert.equal(await readFile(join(f.workdir, 'utf8.txt'), 'utf8'), edited);
+  assert.equal((await stat(join(f.workdir, 'utf8.txt'))).mode & 0o777, 0o755);
+  const count = intents.length;
+  for (const content of ['has\0nul', 'isolated\ud800', '\udc00surrogate']) {
+    const invalid = await f.run('write_file', { path: 'invalid/file.txt', expectedContent: null, content });
+    assert.equal(invalid.isError, true); assert.match(invalid.text, /valid UTF-8/);
+  }
+  assert.equal(intents.length, count, 'Unrepresentable content must be rejected before the durable intent');
+  assert.deepEqual((await readdir(f.workdir)).sort(), ['normal.txt', 'utf8.txt']);
+});
+
+for (const change of ['content', 'mode', 'symlink'] as const) test(`acknowledged file intents recheck ${change} before filesystem effects`, { skip: !capability.sandbox }, async t => {
+  const f = await fixture(t), prepared = deferred(), durable = deferred(), controller = new AbortController();
+  await writeFile(join(f.workdir, 'target.txt'), 'original');
+  f.options.onFileIntent = () => { prepared.resolve(); return durable.promise; };
+  const running = f.run('write_file', { path: 'target.txt', expectedContent: 'original', content: 'replacement' }, controller.signal);
+  t.after(async () => { controller.abort(); durable.resolve(); });
+  await Promise.race([prepared.promise, running.then(() => { throw new Error('Execution finished before preparing'); })]);
+  if (change === 'content') await writeFile(join(f.workdir, 'target.txt'), 'changed outside');
+  if (change === 'mode') await chmod(join(f.workdir, 'target.txt'), 0o700);
+  if (change === 'symlink') { await writeFile(join(f.root, 'outside.txt'), 'outside'); await rm(join(f.workdir, 'target.txt')); await symlink(join(f.root, 'outside.txt'), join(f.workdir, 'target.txt')); }
+  durable.resolve();
+  const result = await running;
+  assert.equal(result.isError, true); assert.match(result.text, /Concurrent modification|Symbolic links/);
+  assert.deepEqual(await readdir(f.workdir), ['target.txt']);
+  assert.equal(await readFile(join(f.workdir, 'target.txt'), 'utf8'), change === 'content' ? 'changed outside' : change === 'symlink' ? 'outside' : 'original');
+  if (change === 'mode') assert.equal((await stat(join(f.workdir, 'target.txt'))).mode & 0o777, 0o700);
+});
+
+test('owner death while a file intent awaits acknowledgement leaves no effects and releases inherited ownership', { skip: !capability.sandbox }, async t => {
+  const f = await fixture(t); f.lock.release();
+  const childSource = `import {acquireOwnerLock} from './src/execution/lock.ts';import {SandboxExecutor} from './src/execution/sandbox.ts';const lock=acquireOwnerLock(process.argv[1]);await new SandboxExecutor().execute({name:'write_file',toolCallId:'pending-intent',args:{path:'pending/file.txt',expectedContent:null,content:'must not exist'}},{workdir:process.argv[2],dataDir:process.argv[1],lockFd:lock.fd,timeoutMs:10000,allowNetwork:false,protectedPaths:[],onFileIntent:async intent=>{process.stdout.write(JSON.stringify(intent)+'\\n');await new Promise(()=>{});}},new AbortController().signal);lock.release();`;
+  const owner = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource, f.dataDir, f.workdir], { cwd: process.cwd(), stdio: ['ignore', 'pipe', 'pipe'] });
+  let output = '', stderr = ''; owner.stdout.on('data', chunk => { output += chunk; }); owner.stderr.on('data', chunk => { stderr += chunk; });
+  t.after(async () => { owner.kill('SIGKILL'); });
+  for (let i = 0; i < 200 && !output.includes('\n') && owner.exitCode === null; i++) await delay(20);
+  assert.ok(output.includes('\n'), stderr || 'Owner never received the file intent');
+  assert.equal(JSON.parse(output.split('\n')[0]!).path, 'pending/file.txt');
+  assert.deepEqual(await readdir(f.workdir), []);
+  assert.throws(() => acquireOwnerLock(f.dataDir), /active owner/);
+  const exited = new Promise(resolve => owner.once('exit', resolve)); owner.kill('SIGKILL'); await exited;
+  let replacement;
+  for (let i = 0; i < 150; i++) { try { replacement = acquireOwnerLock(f.dataDir); break; } catch {} await delay(20); }
+  assert.ok(replacement, 'Waiting helper must release inherited ownership after parent pipe closes'); replacement?.release();
+  await delay(80); assert.deepEqual(await readdir(f.workdir), []);
+});
+
+for (const violation of ['non-file intent', 'duplicate intent', 'early success', 'result while pending', 'oversized frame'] as const) test(`parent helper protocol rejects ${violation} and drains the child`, { skip: !capability.sandbox }, async t => {
+  const f = await fixture(t), originalSpawn = childProcess.spawn, durable = deferred();
+  const intent: FileMutationIntent = { id: 'protocol-intent', path: 'file.txt', before: { exists: false, sourceDigest: null }, after: { exists: true, sourceDigest: sha256('value'), mode: 0o644 } };
+  const prepare = JSON.stringify({ kind: 'file_intent', intent }) + '\n', result = JSON.stringify({ kind: 'result', result: { text: 'not written' } }) + '\n';
+  const source = violation === 'oversized frame' ? `process.stdout.write('x'.repeat(1024*1024+1));setInterval(()=>{},1000);` : `process.stdout.write(${JSON.stringify(violation === 'early success' ? result : violation === 'duplicate intent' ? prepare + prepare : prepare)});${violation === 'result while pending' ? `setTimeout(()=>process.stdout.write(${JSON.stringify(result)}),40);` : ''}setInterval(()=>{},1000);`;
+  // Fault-inject only the protocol peer. The preceding tests exercise the real sandboxed helper.
+  const mocked = t.mock.method(childProcess, 'spawn', ((command: string, args: string[], options: SpawnOptions) => command === '/usr/bin/sandbox-exec' ? originalSpawn(process.execPath, ['-e', source], options) : originalSpawn(command, args, options)) as typeof spawn);
+  syncBuiltinESMExports();
+  t.after(async () => { mocked.mock.restore(); syncBuiltinESMExports(); durable.resolve(); });
+  f.options.onFileIntent = () => durable.promise;
+  await assert.rejects(f.run(violation === 'non-file intent' ? 'read_file' : 'write_file', { path: 'file.txt', expectedContent: null, content: 'value' }), /intent|protocol limit/);
+  durable.resolve(); await delay(30);
+  assert.deepEqual(await readdir(f.workdir), []);
+  f.lock.release(); const replacement = acquireOwnerLock(f.dataDir); replacement.release();
 });

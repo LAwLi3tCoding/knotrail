@@ -1563,3 +1563,27 @@ test('activity links only current plan events and labels same-ID historical even
   await page.getByRole('combobox', { name: 'Language', exact: true }).selectOption('zh-CN');
   await expect(page.locator('.event-footer').filter({ hasText: '历史记录 · Retired adapter step' })).toHaveCount(2);
 });
+
+test('file postcondition evidence remains distinct from unknown execution in English and Chinese', async ({ page }) => {
+  await start(page);
+  await page.evaluate(() => {
+    const state=(window as unknown as {uiTest:{snapshot:TaskSnapshot;change:(patch:Partial<TaskSnapshot>)=>void}}).uiTest,s=state.snapshot;
+    state.change({task:{...s.task,status:'cancelled'},runs:s.runs.map(r=>r.id==='run-2'?{...r,status:'unknown' as const}:r),actions:[{...s.actions[0]!,name:'write_file',status:'unknown',fileIntent:{id:'intent-1',path:'src/adapter.ts',before:{exists:true,sourceDigest:'a'.repeat(64),mode:420},after:{exists:true,sourceDigest:'b'.repeat(64),mode:420},sourceIdentity:'source-identity',preparedAt:s.task.createdAt},filePostcondition:{checkedAt:s.task.createdAt,source:{path:'src/adapter.ts',exists:true,sourceDigest:'b'.repeat(64),sourceIdentity:'source-identity',mode:420}}}]});
+  });
+  const step=page.locator('.plan-tracker [data-node-id="edit"]');await step.locator(':scope > summary').click();
+  const receipt=step.locator('.tool-receipt');await receipt.locator(':scope > summary').click();
+  await expect(receipt.locator(':scope > summary')).toContainText('Unknown');
+  await expect(receipt).toContainText('File postcondition observed');
+  await expect(receipt).toContainText('The earlier operation remains unknown');
+  await receipt.getByText('Prepared file change',{exact:true}).click();await expect(receipt).toContainText('intent-1');
+  await expect(page.getByRole('button',{name:'Inspect unknown effects',exact:true})).toHaveCount(0);
+  await page.getByRole('combobox',{name:'Language',exact:true}).selectOption('zh-CN');
+  await expect(receipt).toContainText('已查证文件后置状态');await expect(receipt).toContainText('此前操作的结果仍未知');
+  await page.setViewportSize({width:360,height:844});await page.locator('.sidebar').getByRole('button',{name:'收起导航',exact:true}).click();
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth)).toBeLessThanOrEqual(360);
+  expect(await receipt.evaluate(element=>element.scrollWidth<=element.clientWidth)).toBe(true);
+  await expect(receipt.locator('pre').last()).toContainText('sourceDigest');
+  await receipt.locator('pre').last().scrollIntoViewIfNeeded();
+  await page.evaluate(()=>new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve()))));
+  await page.screenshot({path:test.info().outputPath('file-postcondition-zh-360.png')});
+});

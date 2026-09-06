@@ -9,6 +9,7 @@ import { validatePlan } from '../src/core/validation.js';
 import { Store, id, now } from '../src/core/store.js';
 import type { Runner, RunnerRequest, RunnerCallbacks } from '../src/runtime/contracts.js';
 import type { Executor } from '../src/execution/contracts.js';
+import { CODEX_BASE_URL } from '../src/shared/contracts.js';
 import type { Project, TaskSnapshot, ImpactPreview } from '../src/shared/contracts.js';
 const draft={sequence:1,summary:'Update the sample and verify it',observations:[{kind:'fact' as const,text:'Sample repository'}],nodes:[{id:'edit',title:'Edit sample',goal:'Update value',dependsOn:[],kind:'edit' as const,inputs:['sample.txt'],outputs:['sample.txt'],checkIds:['check']},{id:'verify',title:'Review result',goal:'Review current files',dependsOn:['edit'],kind:'verify' as const,inputs:['sample.txt'],outputs:['report'],checkIds:['check']}]};
 class FixtureRunner implements Runner {
@@ -284,4 +285,30 @@ test('a false condition followed by the same qualifying content is new observed 
  await until(app,created.task.id,s=>s.task.status==='ready');writeFileSync(join(source,'signal.txt'),'ready');await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});await until(app,created.task.id,s=>s.task.status==='waiting_external'&&s.runs.length===3);
  writeFileSync(join(source,'signal.txt'),'not yet');due(app,created.task.id);await until(app,created.task.id,s=>s.task.wait?.last.status==='waiting');assert.equal(runner.count,3);
  writeFileSync(join(source,'signal.txt'),'ready');due(app,created.task.id);await until(app,created.task.id,s=>s.task.status==='waiting_external'&&s.runs.length===4);assert.equal(runner.count,4);
+});
+
+
+function loginToken(label:string,seconds=Math.floor(Date.now()/1000)+300){return [Buffer.from(JSON.stringify({alg:'RS256'})).toString('base64url'),Buffer.from(JSON.stringify({exp:seconds,jti:label,'https://api.openai.com/auth':{chatgpt_account_id:'synthetic-account'}})).toString('base64url'),'synthetic-signature'].join('.');}
+function loginCache(path:string,token:string){writeFileSync(path,JSON.stringify({auth_mode:'chatgpt',tokens:{access_token:token,refresh_token:'synthetic-refresh-must-stay-local'}}),{mode:0o600});}
+test('Codex login uses a fixed endpoint and rereads access-only credentials for each Run',async t=>{
+ const seen:RunnerRequest['model'][]=[],first=loginToken('first'),second=loginToken('second');let cache='';const fixture=new FixtureRunner();
+ const runner:Runner={async run(r,c,signal){seen.push(r.model);c.onEvent('assistant.delta','safe '+first,{nested:{value:first}});const result=await fixture.run(r,c,signal);if(r.purpose==='planning')loginCache(cache,second);return {...result,summary:'summary '+r.model.apiKey};}};
+ const {app,project,dataDir}=await setup(t,runner);cache=join(dataDir,'synthetic-codex-auth.json');loginCache(cache,first);(app as any).options.codexAuthPath=cache;
+ const saved=await app.command({type:'settings.save',patch:{model:{authSource:'codex-login',modelId:'gpt-6-astra'}}}) as any;assert.equal(saved.model.baseUrl,CODEX_BASE_URL);assert.equal(saved.model.hasApiKey,false);
+ const request=globalThis.fetch;globalThis.fetch=async()=>{throw new Error('Local login check must not request a remote model list');};try{const check=await app.command({type:'model.check'});assert.match(JSON.stringify(check),/Run a task to verify/);}finally{globalThis.fetch=request;}
+ const created=await app.command(create(project,{executionPolicy:'autoWithinGrant'})) as TaskSnapshot;const done=await until(app,created.task.id,s=>s.task.status==='completed');
+ assert.equal(seen.length,3);assert.equal(seen[0]!.apiKey,first);assert.ok(seen.slice(1).every(m=>m.apiKey === second));assert.ok(seen.every(m=>m.authSource==='codex-login'&&m.baseUrl===CODEX_BASE_URL&&m.expiresAt!>Date.now()));
+ const exposed=JSON.stringify(await app.command({type:'bootstrap'}))+JSON.stringify(done)+app.report(done.task.id);assert.ok(!exposed.includes(first)&&!exposed.includes(second));assert.ok(!JSON.stringify(seen).includes('synthetic-refresh-must-stay-local'));assert.equal(JSON.parse(readFileSync(cache,'utf8')).tokens.refresh_token,'synthetic-refresh-must-stay-local');
+});
+test('Codex login rejects caller endpoints, pasted keys and missing cache without creating a task',async t=>{
+ const {app,project,dataDir}=await setup(t);(app as any).options.codexAuthPath=join(dataDir,'absent-login.json');
+ await assert.rejects(app.command({type:'settings.save',patch:{model:{authSource:'codex-login',baseUrl:'https://untrusted.example/v1'}}}),/fixed official/);
+ await assert.rejects(app.command({type:'settings.save',patch:{model:{authSource:'codex-login',apiKey:'x'}}}),/do not enter/);
+ await assert.rejects(app.command({type:'settings.save',patch:{model:{expiresAt:Date.now()+1000}}}));
+ await app.command({type:'settings.save',patch:{model:{authSource:'codex-login',modelId:'gpt-6-astra'}}});await assert.rejects(app.command(create(project)),/cache is unavailable/);assert.equal(app.store.list().length,0);
+});
+test('the Codex access-token expiry bounds an active Run without refreshing the login cache',async t=>{
+ const fixture=new FixtureRunner();const runner:Runner={async run(r,c,signal){if(r.purpose==='planning')return fixture.run(r,c,signal);await new Promise<void>(resolve=>{if(signal.aborted)resolve();else signal.addEventListener('abort',()=>resolve(),{once:true});});return {summary:'aborted at expiry',turns:1,aborted:true};}};
+ const {app,project,dataDir}=await setup(t,runner),cache=join(dataDir,'short-login.json');loginCache(cache,loginToken('short',Math.floor(Date.now()/1000)+2));const before=readFileSync(cache,'utf8');(app as any).options.codexAuthPath=cache;await app.command({type:'settings.save',patch:{model:{authSource:'codex-login',modelId:'gpt-6-astra'}}});
+ const created=await app.command(create(project,{executionPolicy:'autoWithinGrant',maxRunMs:10000})) as TaskSnapshot;const stopped=await until(app,created.task.id,s=>s.task.status==='blocked');assert.match(stopped.task.error!,/Codex login has expired/);assert.equal(stopped.task.acceptedDigest,undefined);assert.equal(stopped.actions.length,0);assert.equal(readFileSync(cache,'utf8'),before);
 });

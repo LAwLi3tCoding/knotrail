@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -9,17 +9,19 @@ import { PiRunner } from '../src/runtime/pi-runner.js';
 import type { RunnerRequest, RunControl, ToolCall } from '../src/runtime/contracts.js';
 
 const draft = { sequence: 1, summary: 'Inspect fixture', observations: [{ kind: 'fact', text: 'Fixture exists' }], nodes: [{ id: 'inspect', title: 'Inspect', goal: 'Read fixture', dependsOn: [], kind: 'research', inputs: ['fixture.txt'], outputs: ['report'], checkIds: [] }] };
-async function fixture(t: { after(fn: () => Promise<void>): void }, responses: { name?: string; args?: unknown; text?: string }[][], reported?: boolean[]) {
+async function fixture(t: { after(fn: () => Promise<void>): void }, responses: { name?: string; args?: unknown; text?: string; error?: boolean }[][], reported?: boolean[]) {
   const root = await mkdtemp(join(tmpdir(), 'knotrail-runtime-')); await mkdir(join(root, 'session'));
   const requests: Record<string, any>[] = [];
   const server = createServer(async (req, res) => {
     let body = ''; for await (const part of req) body += part;
     requests.push(JSON.parse(body));
     const index = requests.length - 1;
-    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
     const chunks = responses[index] || [{ text: 'unexpected turn' }];
+    if (chunks[0]?.error) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: { message: `Denied ${req.headers.authorization}`, type: 'invalid_api_key' } })); return; }
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
     const calls = chunks.filter(item => item.name);
-    const delta = { content: chunks.map(item => item.text || '').join(''), ...(calls.length ? { tool_calls: calls.map((item, i) => ({ index: i, id: `call-${index}-${i}`, type: 'function', function: { name: item.name, arguments: JSON.stringify(item.args) } })) } : {}) };
+    for (const part of chunks.filter(item => item.text !== undefined)) res.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta: { content: part.text }, finish_reason: null }] })}\n\n`);
+    const delta = { ...(calls.length ? { tool_calls: calls.map((item, i) => ({ index: i, id: `call-${index}-${i}`, type: 'function', function: { name: item.name, arguments: JSON.stringify(item.args) } })) } : {}) };
     res.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`);
     res.write(`data: ${JSON.stringify({ id: 'fixture', object: 'chat.completion.chunk', created: 1, model: 'fixture', choices: [{ index: 0, delta: {}, finish_reason: calls.length ? 'tool_calls' : 'stop' }], ...(reported?.[index]===false?{}:{usage: { prompt_tokens: 12, completion_tokens: 8, total_tokens: 20 }}) })}\n\n`);
     res.end('data: [DONE]\n\n');
@@ -87,4 +89,33 @@ test('real pi wait outcome requires a source and condition and closes later tool
  const result=await new PiRunner().run({...f.request,purpose:'node'}, {onEvent(){},onTool:async c=>{tools.push(c);return {text:'unexpected'};},onControl:async c=>{controls.push(c);return {text:'accepted'};}},new AbortController().signal);
  assert.equal(result.turns,2);assert.equal(controls.length,1);assert.deepEqual(controls[0],{kind:'wait',reason:'Waiting for input',minutes:1,source:{kind:'project_file',path:'status.txt'},condition:{kind:'contains',text:'ready'}});assert.equal(tools.length,0);
  assert.ok(JSON.stringify(f.requests[1].messages).includes('source'));
+});
+
+test('runtime redacts split token deltas, tool/control values, replies, results and persisted sessions', async t => {
+  const responses: { name?: string; args?: unknown; text?: string }[][] = [[], []];
+  const f = await fixture(t, responses), key = f.request.model.apiKey!, split = Math.floor(key.length / 2);
+  responses[0] = [{ text: `Before ${key.slice(0, split)}` }, { text: `${key.slice(split)} after.` }, { name: 'write_file', args: { path: 'safe.txt', content: `nested ${key}`, expectedContent: null } }];
+  responses[1] = [{ name: 'outcome', args: { kind: 'complete', summary: `Done ${key}` } }];
+  const events: unknown[] = [], calls: ToolCall[] = [], controls: RunControl[] = [], text: string[] = [];
+  const result = await new PiRunner().run({ ...f.request, purpose: 'node', objective: `Protect ${key}` }, {
+    onEvent(kind, value, data) { events.push({ kind, value, data }); if (kind === 'assistant.delta') text.push(value); },
+    onTool: async call => { calls.push(call); return { text: `reply ${key}` }; },
+    onControl: async control => { controls.push(control); return { text: 'accepted' }; },
+  }, new AbortController().signal);
+  assert.equal(text.join(''), 'Before [redacted] after.');
+  assert.equal(calls[0]!.args.content, 'nested [redacted]');
+  assert.deepEqual(controls, [{ kind: 'complete', summary: 'Done [redacted]' }]);
+  assert.equal(result.summary, 'Done [redacted]');
+  assert.equal(JSON.stringify({ events, calls, controls, result, requests: f.requests }).includes(key), false);
+  const saved = await readFile(result.sessionPath!, 'utf8');
+  assert.equal(saved.includes(key), false); assert.ok(saved.includes('reply [redacted]'));
+});
+
+test('runtime redacts provider errors before returning them or saving the session', async t => {
+  const f = await fixture(t, [[{ error: true }]]), key = f.request.model.apiKey!;
+  await assert.rejects(new PiRunner().run(f.request, { onEvent() {}, onTool: async () => ({ text: 'unexpected' }), onControl: async () => ({ text: 'unexpected' }) }, new AbortController().signal), (error: Error) => {
+    assert.equal(error.message.includes(key), false); assert.match(error.message, /Denied Bearer \[redacted\]/); return true;
+  });
+  const files = (await readdir(f.request.sessionDir, { recursive: true })).filter(path => path.endsWith('.jsonl'));
+  for (const path of files) assert.equal((await readFile(join(f.request.sessionDir, path), 'utf8')).includes(key), false);
 });

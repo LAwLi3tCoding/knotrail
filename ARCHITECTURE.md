@@ -131,11 +131,13 @@ Main 等 Runner 及其工具收尾后，读取来源并建立 WaitState。来源
 
 Renderer 使用 sandbox、contextIsolation，关闭 Node 集成。preload 只暴露固定 command、事件订阅、原生目录选择、报告导出。Main 检查发送者窗口和主 frame、命令大小及 Zod 字段，禁止新窗口、外部导航、webview 和页面权限申请。
 
-模型密钥通过 Electron safeStorage 加密后存在用户数据目录。Renderer 可以替换或清除密钥，但读取设置只得到 `hasApiKey`。模型请求只在 pi Worker 发出；工具 helper 的环境不会继承 API key。事件和回执会过滤当前配置密钥，pi 会话不保存该配置密钥。
+API 模式的密钥通过 Electron safeStorage 加密后存在用户数据目录。Renderer 可以替换或清除密钥，但读取设置只得到 `hasApiKey`。模型请求只在 pi Worker 发出，工具 helper 不继承凭据。Worker 在保存会话前过滤当前访问凭据，流式文本保留可能跨分片的凭据前缀；PiRunner 与 Core 再过滤事件、结果和嵌套字段。Core 保留本次宿主生命期内用过的敏感值用于过滤轮换后的旧值，不将其持久化。
 
-端点允许 HTTPS，以及仅回环地址上的 HTTP；拒绝带用户名、密码、查询参数或片段的 URL。连接检查调用 `/models` 并匹配模型 ID，它不等于工具调用成功。当前接线是 OpenAI-compatible Chat Completions，未自动使用 Codex 登录，也未硬编码未经服务端证实可用的 GPT-6 Astra API 名称。Astra 的访问与兼容性必须在用户自己的模型服务上确认。
+API 模式允许 HTTPS，以及仅回环地址上的 HTTP；拒绝带用户名、密码、查询参数或片段的 URL。连接检查调用 `/models` 并匹配模型 ID，它不等于工具调用成功。
 
-后续交付还包含 Codex 账户登录接入，以及安装到本机后使用实际会话验证。该接入尚未完成；不能将现有 API key 接口、模型列表检查或 loopback smoke 视为订阅登录兼容性和真实 Astra 任务验收。
+Codex 模式由用户明确选择。Core 每个 Run 从 Codex 本机登录缓存重新读取 access token，校验普通文件、大小、JSON、ChatGPT 模式、JWT 账户字段与到期时间；不提取刷新凭据、不写回缓存，也不负责登录或刷新。固定官方 `https://chatgpt.com/backend-api/codex/responses` 是唯一模型请求目的地，强制 SSE、POST 和拒绝重定向。模型注册保留 `openai-codex` provider 身份，避免跨轮工具 ID 被转换。pi 目录包含 `gpt-6-astra`，但目录存在和本地登录检查不能证明服务端可用。
+
+Run 期限取任务预算与 access token 到期时间的较早值，到期取消后须回到 Codex 更新登录。Codex Responses 的输出额度由服务控制；该路径不宣称本地 maxTokens 能限制服务端生成。任务轮数、运行时间和沙箱限制继续生效。ChatGPT 订阅认证与独立计费的 Platform API key 是两种接入方式；实现依据见 [官方认证说明](https://learn.chatgpt.com/docs/auth)。真实账户任务和本机安装证据单列于验证记录。
 
 ## 10. 执行隔离的准确范围
 

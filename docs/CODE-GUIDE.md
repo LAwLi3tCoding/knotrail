@@ -16,6 +16,9 @@
 | `src/runtime/contracts.ts` | Runner、工具请求和结构化结果的边界 |
 | `src/runtime/pi-runner.ts` | 创建并管理每 Run 独立 Worker；把工具和控制请求交回 Main |
 | `src/runtime/pi-worker.ts` | 实际 pi SDK 接线、显式模型和资源加载范围、工具定义、消息事件 |
+| `src/core/codex-auth.ts` | 每 Run 只读 Codex 本机登录，返回 access token 与到期时间 |
+| `src/runtime/codex-provider.ts` | 固定官方 SSE 传输、access-only provider、请求到期复核 |
+| `src/runtime/redaction.ts` | 嵌套结果与跨分片文本的凭据过滤 |
 | `src/execution/contracts.ts` | 执行器、沙箱选项和 owner lock 接口 |
 | `src/execution/sandbox.ts` | 沙箱能力检查、权限配置、helper 启动、取消和回收 |
 | `src/execution/helper.mjs` | 纯 Node stdlib 文件操作、argv 命令、输出限制、父管道断连收尾 |
@@ -60,7 +63,7 @@ interface DesktopAPI {
 | `task.files` / `task.readFile` | taskId 与相对路径 | 有范围限制的只读结果 |
 | `task.export` | taskId | 在应用数据目录导出报告并返回路径 |
 | `settings.save` | 允许字段的 patch | 不含 apiKey 的设置 |
-| `model.check` | 无 | `/models` 与精确 modelId 校验 |
+| `model.check` | 无 | API 模式校验 `/models` 与 modelId；Codex 模式仅检查本机登录格式/有效期，不发请求 |
 | `preferences.get/save` | taskId、视图偏好 | 独立于任务执行的布局与草稿 |
 
 未知命令和字段会失败。需要版本检查的命令收到旧 `expectedRevision` 会要求刷新；重用 requestId 却改变内容会被拒绝。报告另有原生 Save 对话框入口，用户选择路径后 Main 写文件。
@@ -109,7 +112,11 @@ initial final acceptance → maintain healthy
 
 每个 `RunnerRequest` 包含实际 Run ID、规划/节点用途、工作目录、独立会话目录、模型配置、目标、检查、当前计划、节点、既往摘要、剩余轮数和超时。登记过等待时，context 还包含 WaitState 的来源身份、最近观察时间/内容和消费记录，并明确原项目观察不会自动复制到 worktree。身份来自 Coordinator，不接受模型自行指定任务或 Run。维护用的 verification Run 不构造 RunnerRequest。
 
-Worker 使用已固定版本的 `@earendil-works/pi-coding-agent`。项目和全局扩展、默认工具、技能和资源自动发现被关闭；只注册 Knotrail 明确提供的工具。配置显式构造 OpenAI-compatible Chat Completions 模型，支持自定义 baseUrl、modelId、thinking、contextWindow 和 maxTokens。
+Worker 使用已固定版本的 `@earendil-works/pi-coding-agent`。项目和全局扩展、默认工具、技能和资源自动发现被关闭；只注册 Knotrail 明确提供的工具。API 模式显式构造 OpenAI-compatible Chat Completions 模型，支持自定义 baseUrl、modelId、thinking、contextWindow 和 maxTokens。
+
+`ModelConfig.authSource='codex-login'` 时，Core 的 `model()` 调用 `readCodexLogin()`，使用内部 apiKey 字段传递 access token，并附 expiresAt；这两个字段都不进入设置回读。Renderer 无权提交 expiresAt，也不能为此模式指定其他 baseUrl 或粘贴密钥。Worker 注册 `codexProvider()` 后使用 pi 内置 `openai-codex` 模型元数据。provider 不能改成其他别名，否则 Responses 的 `call_id|item_id` 可能在下一轮函数结果中丢失。
+
+该 provider 不加载 OAuth store，不刷新令牌；每次 POST 前复核到期和精确官方 URL，禁用 WebSocket 和 SDK 通用重试，禁止重定向。仅在收到响应头前遭遇指定连接中断时，最多额外尝试两次，等待可取消且再次校验到期；HTTP 错误与响应头后的断流不重试。Worker 记录 `provider.retry`，并将已知用量标为 partial，因为服务端可能已经处理过中断请求。没有收到模型工具调用前不会执行本地效果。Core 和 PiRunner 的总期限也受 access token 到期约束。Codex 模式的输出上限采用服务端约束，不发送无效的 Chat Completions token 参数。
 
 `turn.started` 在实际模型轮开始时写入持久预算；`assistant.delta` 用于公开文字流。工具执行与控制请求通过带消息 ID 的 RPC 排队，父进程返回 `ToolResult`。一次终止结果被接受后，双方都关闭后续准入。
 
@@ -184,6 +191,10 @@ acceptance、model、recovery 使用显式 kind 分派，模型不能用问题�
 
 右侧规划开关存在 AppSettings；每个任务的节点和页签选择存在 TaskPreferences。打开或关闭不触发运行，切换语言不重建任务，不翻译原始模型输出、用户输入、命令或代码。
 
+`PlanTracker` 在主对话呈现全部当前节点，以 activePlanId、TaskRevision 和 NodeState 计算已验证数量。`StepEvidence` 按节点的 runId 分离当前与历史产出；同名节点在另一版 Plan 中的记录不成为当前完成依据。`RunRecord` 用 runId + toolCallId 找到 tool.started 中的参数，并与 ActionReceipt 输出、检查和 Artifact 关联，缺失参数明确标为未记录。`DecisionRecord` 复用宿主决定文案规则，保留模型问题原文。
+
+计划版本选择由 App 统一持有；当前步骤入口显式选择 current，手动切换的历史版本在侧栏关闭/打开期间保留。`EventStep` 同时用于主对话与活动记录，只为当前 Plan/TaskRevision 的节点提供当前步骤入口，旧事件显示历史标签。所选节点被新版删除时给出说明，不悄悄展示另一个节点。
+
 `TaskObservations` 在主对话、规划过程与定时任务页复用，展示 Wait 来源/条件、最近观察内容与摘要、Task/Plan/Run 身份，以及维护健康、批次和漏查时间。标签来自中英字典；观察内容和来源错误保留原文。卡片从真实 consumedAt 显示消费时间，不以 satisfied 推断已消费。`scheduledStatuses` 为等待和三种维护状态提供暂停入口，两项已纳入本轮通过的 UI 回归。整体计划、todo、工具调用和决定逐步展开的强化尚未全部完成。
 
 窄屏规划栏固定在右边，支持 Escape 关闭与键盘操作。文件预览仅渲染文本；Preview 不是任意 HTML 网站执行器。Terminal 展示已执行命令的真实回执，没有额外的 unrestricted interactive shell。
@@ -224,6 +235,6 @@ UI fixture 不能证明模型接线；pi HTTP fixture 不能证明某个线上�
 
 等待/维护的最小回归位于 `tests/core.test.ts`：来源不变不增加模型 Run、自身写入建立基线、来源不可达/过大/替换、跨 Wait 消费去重、暂停恢复先观察、漏周期合并、持久边界重建、观察变化使验收失效，以及维护失败/unknown 仅运行检查。新增来源在恢复前/Run 中撤销、显式改目标后使用现有来源、A → B → A → B 与不满足后恢复相同内容的回归。`tests/runtime.test.ts` 经真实 pi 协议验证 Wait 必填参数拒绝和终止后的写入不准入；`tests/ui-workbench.spec.ts` 验证双语观察卡片与维护证据。真实远端模型、真实休眠/强杀和自然长期任务仍需独立验收。
 
-后续 Codex 账户登录适配尚未完成，本机安装后实际会话与 Astra 任务验收也未完成。新增身份验证路径应与现有 provider 配置明确区分；测试和公开文档不得写入真实凭据、会话内容或本机私有路径。
+Codex 登录适配的合成回归位于 `codex-auth.test.ts`、`codex-runtime.test.ts` 及 Core/runtime 测试中，覆盖轮换、固定地址、到期取消、工具 ID 和脱敏；这些测试不使用用户凭据。实际账户与安装验证另见验证记录，公开文档不记录真实凭据、私有会话或本机私有路径。
 
 修改执行协议时，优先在 Core 的状态入口和 Runner/Executor 边界补一个可观察失败的回归。不要让 Renderer 成为第二个调度器，也不要让模型自行填写 verified 或 completed。添加新工具必须同时定义参数边界、允许阶段、沙箱权限、回执与取消语义。

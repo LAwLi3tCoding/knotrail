@@ -1,3 +1,5 @@
+export const CODEX_BASE_URL = 'https://chatgpt.com/backend-api';
+export const CODEX_RESPONSES_URL = CODEX_BASE_URL + '/codex/responses';
 export type Locale = 'system' | 'zh-CN' | 'en';
 export type TaskMode = 'once' | 'finite' | 'maintain';
 export type TaskStatus = 'planning' | 'ready' | 'executing' | 'verifying' | 'waiting_user' | 'waiting_external' | 'reconciling' | 'blocked' | 'paused' | 'cancelled' | 'expired' | 'completed' | 'healthy' | 'unhealthy' | 'unknown';
@@ -28,8 +30,8 @@ export interface CheckReceipt { observationDigest?: string; batchId?: string; sc
 export interface Decision { kind?: 'model' | 'acceptance' | 'recovery'; recovery?: { terminalStatus?: 'cancelled' | 'expired' | 'completed'; actionIds: string[]; actionsDigest: string; workspaceDigest: string; artifactId: string }; id: string; taskId: string; taskRevision: number; planId?: string; nodeId?: string; question: string; options: string[]; answer?: string; createdAt: string }
 export interface ImpactPreview { id: string; taskId: string; expectedRevision: number; expectedPlanId?: string; workspaceDigest: string; objective?: string; nodeId?: string; affected: string[]; retained: string[]; reason: string }
 export interface TaskSnapshot { task: Task; plan?: PlanRevision; plans: PlanRevision[]; draft?: PlanDraft; nodes: NodeState[]; runs: Run[]; events: TaskEvent[]; artifacts: Artifact[]; actions: ActionReceipt[]; checks: CheckReceipt[]; decisions: Decision[]; lastSequence: number }
-export interface ModelConfig { baseUrl: string; modelId: string; apiKey?: string; thinking: 'off' | 'low' | 'medium' | 'high'; contextWindow: number; maxTokens: number }
-export interface AppSettings { locale: Locale; model: Omit<ModelConfig, 'apiKey'> & { hasApiKey: boolean }; planningOpen: boolean; responseLanguage: 'task' | 'zh-CN' | 'en'; allowNetwork: boolean }
+export interface ModelConfig { authSource?: 'api-key' | 'codex-login'; expiresAt?: number; baseUrl: string; modelId: string; apiKey?: string; thinking: 'off' | 'low' | 'medium' | 'high'; contextWindow: number; maxTokens: number }
+export interface AppSettings { locale: Locale; model: Omit<ModelConfig, 'apiKey' | 'expiresAt'> & { hasApiKey: boolean }; planningOpen: boolean; responseLanguage: 'task' | 'zh-CN' | 'en'; allowNetwork: boolean }
 export interface TaskPreferences { panelView: 'process' | 'steps'; selectedNode?: string; detailTab: 'overview' | 'artifacts' | 'checks' | 'history'; mainView: 'chat' | 'activity' | 'changes'; toolPanel: 'files' | 'terminal' | 'preview' | null; graphView: 'graph' | 'list'; draft: string }
 export interface Bootstrap { projects: Project[]; tasks: Task[]; settings: AppSettings; capabilities: { sandbox: boolean; reason?: string; platform: string }; version: string }
 export type AppCommand =

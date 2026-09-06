@@ -1,6 +1,22 @@
 import type { Locale } from '../shared/contracts';
 
 const zh = {
+  'Output limits follow the Codex service. Task turn and time budgets still apply.': '输出上限由 Codex 服务决定；任务的轮次和时长预算仍然有效。',
+  'Authentication': '认证方式', 'API key or local endpoint': 'API key 或本地服务', 'Existing Codex login': '已有 Codex 登录', 'Check saved login': '检查已保存的登录方式',
+  'Uses your existing local Codex sign-in. Sign in with Codex first; each run reads the current login.': '使用本机已有的 Codex 登录。请先登录 Codex；每次运行都会读取当前登录状态。',
+  'The login check only inspects local credentials. An actual task verifies account access and tool calling. Save changes first.': '此检查只读取本机登录信息；账户权限和工具调用需要通过实际任务验证。请先保存设置。',
+  'Local Codex login is available. Run a task to verify model access and tool calling.': '本机 Codex 登录信息可用。请运行任务，验证模型权限和工具调用。',
+  'Codex login requires the fixed official endpoint': 'Codex 登录必须使用固定的官方服务地址',
+  'Codex login uses its own sign-in; do not enter an API key': 'Codex 登录使用已有登录信息，无需填写 API key',
+  'Codex login cache is unavailable. Sign in to Codex and try again.': '无法读取 Codex 登录信息。请先登录 Codex，再重试。',
+  'Codex login cache is invalid. Sign in to Codex again.': 'Codex 登录信息格式无效。请重新登录 Codex。',
+  'Codex login requires ChatGPT authentication.': '此方式需要通过 ChatGPT 登录 Codex。',
+  'Codex login access token is invalid. Sign in to Codex again.': 'Codex 登录令牌无效。请重新登录 Codex。',
+  'Codex login has expired. Sign in to Codex again.': 'Codex 登录已过期。请重新登录 Codex。',
+  'Codex sign-in expired. Update the sign-in in Codex, then resume.': 'Codex 登录已过期。请在 Codex 更新登录，再继续任务。',
+  'Configured model is not available in the local provider catalog': '本机模型目录中没有该模型，请检查模型 ID。',
+  'Consumed observation changed or cannot be verified. Review the source and revise or retry explicitly before continuing.': '已使用的观测来源发生变化或无法核实。请检查来源，再修改要求或重做步骤。',
+
   'New task': '新任务', 'Search tasks': '搜索任务', 'Capabilities': '内置能力', 'Scheduled tasks': '定时任务',
   'Projects': '项目', 'Add project': '添加项目', 'Settings': '设置', 'Language': '界面语言', 'System': '跟随系统',
   'Collapse navigation': '收起导航', 'Expand navigation': '展开导航', 'No matching tasks': '没有匹配的任务',
@@ -89,6 +105,16 @@ const zh = {
   'running': '执行中', 'verified': '已验证', 'stale': '需重新验证', 'failed': '失败', 'unknown': '待确认',
   'pending': '进行中', 'succeeded': '成功', 'aborted': '已中止', 'pass': '通过', 'fail': '未通过',
   'waiting': '条件未满足', 'satisfied': '条件已满足',
+  'Task steps': '任务步骤', 'Verified steps': '已验证步骤', 'Pending step': '待执行',
+  'Recorded progress and outputs': '已记录的进度与产出', 'Declared inputs': '声明的输入',
+  'Actual outputs': '实际产出', 'Actual artifacts': '实际产物', 'Tool activity': '工具操作',
+  'Tool parameters': '工具参数', 'No output recorded yet': '尚未记录输出', 'No tool operations recorded': '尚未记录工具操作',
+  'Parameters were not recorded for this operation.': '此次操作未记录参数。', 'Recorded model summaries': '已记录的模型摘要',
+  'Recorded decisions': '已记录的决定', 'Not answered': '尚未回答', 'Earlier attempts': '此前尝试',
+  'No current attempt output. Earlier records are kept in history.': '当前尝试尚无产出，此前记录保留在历史中。',
+  'Historical outputs do not establish current progress.': '历史产出不代表当前步骤已完成。',
+  'Open in planning': '在规划栏中打开', 'Ended': '结束时间', 'Disposition recorded': '已记录处置',
+  'This step is absent from this plan. Choose another step or an earlier plan version to inspect its records.': '此计划中已没有该步骤。请选择其他步骤，或切换到此前的计划版本查看记录。',
 } as const;
 
 export type TextKey = keyof typeof zh;
@@ -105,5 +131,9 @@ const statusEn: Record<string, string> = {
 };
 export function translator(locale: Locale) {
   const resolved = resolveLocale(locale);
-  return (key: TextKey): string => resolved === 'zh-CN' ? (zh[key] ?? key) : (statusEn[key] ?? key);
+  return (key: TextKey): string => {
+    if (resolved !== 'zh-CN') return statusEn[key] ?? key;
+    const connection = /^Codex connection failed( \([A-Z_]+\))?\. Check the network and resume the task\.$/.exec(key);
+    return connection ? `Codex 连接失败${connection[1] ?? ''}。请检查网络后继续任务。` : zh[key] ?? key;
+  };
 }

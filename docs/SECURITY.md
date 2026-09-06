@@ -5,7 +5,9 @@ Knotrail v0.1 是个人 macOS 编码工具。只在可信项目中执行命令�
 ## 已有控制
 
 - Renderer 无 Node，IPC 校验窗口、主 frame、字段和长度；外部导航、webview、新窗口与权限请求被拒绝。
-- 模型密钥由 safeStorage 加密；设置回读只有 hasApiKey，执行 helper 不继承 API key 环境。
+- API 密钥由 safeStorage 加密；设置回读只有 hasApiKey，执行 helper 不继承凭据。Codex 模式每 Run 只读现有 ChatGPT access token，不刷新、不修改源缓存，不将令牌持久化到 Knotrail 设置。
+- Codex 传输只允许固定官方 Responses URL，强制 SSE/POST，拒绝重定向；请求与 Run 都受 access token 到期约束。本地 JWT 字段检查不是签名或服务端权限验证。
+- 配置凭据在流式分片、嵌套工具/控制结果、错误、事件和 pi 会话落盘前过滤。令牌通过私有 Main → Worker 启动消息传递，不回传 Renderer；过滤不等于识别任意项目秘密。
 - 每任务独立 Git worktree；只读规划无命令/写工具；所有效果经过 Main 和 OS helper。
 - 文件边界与 macOS sandbox 同时限制越界、`.git` 和受保护路径；网络默认关闭。
 - 效果前写 pending，未知状态阻止自动重放；内核租约随 helper 继承。

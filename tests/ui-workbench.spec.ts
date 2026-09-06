@@ -71,7 +71,7 @@ async function start(page: Page) {
             case 'decision.answer': { const decision = data.decisions.find(item => item.id === command.decisionId); if (decision) decision.answer = command.answer; data.task.status = decision?.recovery?.terminalStatus ?? 'executing'; data.lastSequence++; notify(); return data; }
             case 'task.files': return { files: ['src/adapter.ts', 'README.md'] };
             case 'task.readFile': return { content: 'export const adapter = "safe";', truncated: false };
-            case 'model.check': return { ok: true, message: 'Connection passed' };
+            case 'model.check': return { ok: true, message: boot.settings.model.authSource === 'codex-login' ? 'Local Codex login is available. Run a task to verify model access and tool calling.' : 'Connection passed' };
             case 'task.create': Object.assign(data.task, { objective: command.objective, checks: command.checks, mode: command.mode, executionPolicy: command.executionPolicy, status: 'planning', intervalMinutes: command.intervalMinutes, expiresAt: command.expiresAt }); data.lastSequence++; notify(); return data;
             case 'project.add': return boot.projects[0];
             default: return { ok: true };
@@ -391,4 +391,173 @@ test('maintenance shows observation bindings, resumes only checks, and verificat
   expect(commands.filter(command => command.type === 'task.pause')).toHaveLength(3);
   expect(commands.some(command => command.type === 'task.cancel')).toBe(false);
   expect(commands.some(command => command.type === 'task.applyImpact' || command.type === 'task.previewRetry')).toBe(false);
+});
+
+
+test('Codex subscription login has a separate bilingual settings flow without key or custom endpoint fields',async ({page})=>{
+ await start(page);await page.getByRole('button',{name:'Settings',exact:true}).click();await page.getByRole('button',{name:'Models',exact:true}).click();
+ await page.getByLabel('Authentication',{exact:true}).selectOption('codex-login');await expect(page.getByLabel('API key',{exact:true})).toHaveCount(0);await expect(page.getByLabel('Base URL',{exact:true})).toHaveCount(0);await page.getByLabel('Model ID',{exact:true}).fill('gpt-6-astra');
+ await page.getByRole('button',{name:'Save settings',exact:true}).click();await page.getByRole('button',{name:'Check saved login',exact:true}).click();await expect(page.getByRole('status')).toContainText('Run a task to verify model access');
+ const commands=await page.evaluate(()=>(window as unknown as {uiTest:{commands:AppCommand[]}}).uiTest.commands);expect(commands.find(c=>c.type==='settings.save')).toMatchObject({patch:{model:{authSource:'codex-login',modelId:'gpt-6-astra',baseUrl:'https://chatgpt.com/backend-api'}}});expect(JSON.stringify(commands)).not.toContain('apiKey');
+ await page.getByRole('button',{name:'General',exact:true}).click();await page.locator('#settings-locale').selectOption('zh-CN');await page.getByRole('button',{name:'模型',exact:true}).click();await expect(page.getByLabel('认证方式',{exact:true})).toHaveValue('codex-login');await page.getByRole('button',{name:'检查已保存的登录方式',exact:true}).click();await expect(page.getByRole('status')).toContainText('本机 Codex 登录信息可用');await expect(page.locator('.app')).not.toContainText('程迹');
+});
+
+test('task steps stream canonical progress and recorded inputs and outputs with planning closed', async ({ page }) => {
+  await start(page);
+  const tracker = page.locator('.plan-tracker');
+  const edit = tracker.locator('[data-node-id="edit"]');
+  await expect(tracker.getByRole('progressbar')).toHaveAttribute('value', '1');
+  await edit.locator(':scope > summary').click();
+  await expect(edit).toContainText('Preserve exported signatures.');
+  await expect(edit.getByText('Declared inputs', { exact: true })).toBeVisible();
+  await expect(edit.getByText('Expected outputs', { exact: true })).toBeVisible();
+  await expect(edit.getByText('Actual outputs', { exact: true })).toBeVisible();
+  await edit.locator('.tool-receipt > summary').click();
+  await expect(edit).toContainText('Parameters were not recorded for this operation.');
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    const s = state.snapshot;
+    state.change({ actions: [{ ...s.actions[0]!, name: 'write_file', status: 'pending', output: undefined }], events: [...s.events,
+      { id: 'other-tool', seq: 3, taskId: s.task.id, taskRevision: 1, planId: 'plan-1', nodeId: 'edit', runId: 'run-other', kind: 'tool.started', text: 'write_file', data: { toolCallId: 'call-1', args: { path: 'WRONG-RUN.txt' } }, createdAt: '2026-09-06T09:01:00Z' },
+      { id: 'tool', seq: 4, taskId: s.task.id, taskRevision: 1, planId: 'plan-1', nodeId: 'edit', runId: 'run-2', kind: 'tool.started', text: 'write_file', data: { toolCallId: 'call-1', args: { path: 'src/adapter.ts', content: 'export const nextAdapter = true;', expectedContent: 'old adapter' } }, createdAt: '2026-09-06T09:02:00Z' },
+    ] });
+  });
+  await expect(edit.locator('.tool-receipt')).toContainText('Pending');
+  await expect(edit.locator('.tool-fields')).toContainText('export const nextAdapter = true;');
+  await expect(edit.locator('.tool-fields')).not.toContainText('WRONG-RUN.txt');
+  await expect(edit.locator('.tool-fields')).toContainText('No output recorded yet');
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    const s = state.snapshot;
+    state.change({ actions: [{ ...s.actions[0]!, status: 'succeeded', output: 'Saved adapter with conflict-safe replacement', endedAt: '2026-09-06T09:03:00Z' }], runs: s.runs.map(run => run.id === 'run-2' ? { ...run, status: 'succeeded', summary: 'Implementation updated; verification pending.' } : run) });
+  });
+  await expect(edit.locator('.tool-fields')).toContainText('Saved adapter with conflict-safe replacement');
+  await expect(edit).toContainText('Implementation updated; verification pending.');
+  await expect(tracker.getByRole('progressbar')).toHaveAttribute('value', '1'); // A model report is not a verified NodeState.
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ nodes: state.snapshot.nodes.map(node => node.nodeId === 'edit' ? { ...node, status: 'verified' } : node) });
+  });
+  await expect(tracker.getByRole('progressbar')).toHaveAttribute('value', '2');
+  await expect(page.getByRole('complementary', { name: 'Planning' })).toHaveCount(0);
+  await page.getByRole('combobox', { name: 'Language', exact: true }).selectOption('zh-CN');
+  await expect(edit.getByText('实际产出', { exact: true })).toBeVisible();
+  await expect(edit.locator('.tool-fields')).toContainText('export const nextAdapter = true;');
+  await page.setViewportSize({ width: 360, height: 844 });
+  await page.locator('.sidebar').getByRole('button', { name: '收起导航', exact: true }).click();
+  await edit.locator('.artifact > summary').click();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(360);
+  expect(await tracker.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await page.screenshot({ path: test.info().outputPath('step-records-360-zh.png') });
+});
+
+test('retry and plan revision preserve history without treating prior same-ID outputs as current', async ({ page }) => {
+  await start(page);
+  const tracker = page.locator('.plan-tracker');
+  const edit = tracker.locator('[data-node-id="edit"]');
+  await edit.locator(':scope > summary').click();
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    const s = state.snapshot;
+    state.change({ nodes: s.nodes.map(node => node.nodeId === 'edit' ? { ...node, status: 'stale', reason: 'Explicit retry invalidated this result' } : node), runs: s.runs.map(run => ({ ...run, status: 'succeeded' })), decisions: [{ id: 'answered-step', kind: 'model', taskId: s.task.id, taskRevision: 1, planId: 'plan-1', nodeId: 'edit', question: 'Keep the adapter signature?', options: ['Keep signature'], answer: 'Keep signature', createdAt: '2026-09-06T09:03:00Z' }] });
+  });
+  await expect(edit).toContainText('No current attempt output.');
+  await expect(edit.locator('.step-evidence > .run-record')).toHaveCount(0);
+  await expect(edit).toContainText('Keep signature');
+  await edit.locator('.step-history > summary').click();
+  await edit.locator('.step-history .run-record > summary').click();
+  await edit.locator('.step-history .artifact > summary').click();
+  await expect(edit.locator('.step-history')).toContainText('nextAdapter(input)');
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    const s = state.snapshot;
+    state.change({ nodes: s.nodes.map(node => node.nodeId === 'edit' ? { ...node, status: 'running', attempt: 2, runId: 'run-retry' } : node), runs: [...s.runs, { ...s.runs[1]!, id: 'run-retry', status: 'running', attempt: 2, startedAt: '2026-09-06T09:05:00Z', summary: 'Second attempt in progress' }] });
+  });
+  await expect(edit.locator('.step-evidence > .run-record')).toHaveAttribute('data-run-id', 'run-retry');
+  await expect(edit.locator('.step-evidence > .run-record')).not.toContainText('nextAdapter(input)');
+  await expect(tracker.getByRole('progressbar')).toHaveAttribute('value', '1');
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    const s = state.snapshot;
+    const plan = { ...s.plan!, id: 'plan-2', taskRevision: 2, revision: 2, nodes: [s.plan!.nodes[1]!] };
+    state.change({ task: { ...s.task, revision: 2, activePlanId: plan.id }, plan, plans: [...s.plans, plan], nodes: [{ nodeId: 'edit', status: 'queued', attempt: 0 }] });
+  });
+  await expect(tracker.getByRole('progressbar')).toHaveAttribute('value', '0');
+  await expect(tracker.locator('.tracker-step')).toHaveCount(1);
+  await edit.locator(':scope > summary').click();
+  await expect(edit.locator('.step-evidence > .run-record')).toHaveCount(0);
+  await expect(edit).toContainText('No current attempt output.');
+  await edit.locator('.step-history > summary').click();
+  await expect(edit.locator('.step-history .run-record')).toHaveCount(2);
+  await expect(edit.locator('.step-history')).toContainText('plan-1');
+  await expect(edit.locator('.step-history')).toContainText('Keep signature');
+  await page.getByRole('button', { name: 'Planning', exact: true }).click();
+  await page.getByRole('button', { name: 'Steps', exact: true }).click();
+  await page.getByRole('combobox', { name: 'Plan versions', exact: true }).selectOption('plan-1');
+  await page.getByRole('button', { name: /Inspect callers.*Historical plan/ }).click();
+  await page.getByRole('combobox', { name: 'Plan versions', exact: true }).selectOption('current');
+  await expect(page.locator('.removed-step')).toContainText('This step is absent from this plan.');
+  await expect(page.locator('.node-detail')).toHaveCount(0);
+});
+
+test('opening a current step exits historical planning while manual history survives sidebar toggles', async ({ page }) => {
+  await start(page);
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    const s = state.snapshot;
+    const old = { ...s.plan!, id: 'plan-old', revision: 0, nodes: s.plan!.nodes.map(node => node.id === 'edit' ? { ...node, goal: 'Historical goal with a different contract.' } : node) };
+    state.change({ plans: [old, ...s.plans] });
+  });
+  await page.getByRole('button', { name: 'Planning', exact: true }).click();
+  await page.getByRole('button', { name: 'Steps', exact: true }).click();
+  const panel = page.getByRole('complementary', { name: 'Planning', exact: true });
+  const versions = panel.getByRole('combobox', { name: 'Plan versions', exact: true });
+  await versions.selectOption('plan-old');
+  await panel.getByRole('button', { name: /Update the adapter.*Historical plan/ }).click();
+  await expect(panel.locator('.node-detail')).toContainText('Historical goal with a different contract.');
+  await page.getByRole('button', { name: 'Close planning', exact: true }).click();
+  await page.getByRole('button', { name: 'Planning', exact: true }).click();
+  await expect(versions).toHaveValue('plan-old');
+  const step = page.locator('.plan-tracker [data-node-id="edit"]');
+  await step.locator(':scope > summary').click();
+  await step.getByRole('button', { name: 'Open in planning', exact: true }).click();
+  await expect(versions).toHaveValue('current');
+  await expect(panel.locator('.node-detail')).toContainText('Preserve exported signatures.');
+  await expect(panel.locator('.node-detail > .detail-content > dl')).not.toContainText('Historical goal with a different contract.');
+  await versions.selectOption('plan-old');
+  await expect(panel.locator('.node-detail')).toContainText('Historical goal with a different contract.');
+  await page.getByRole('button', { name: /Upgrade the adapter.*Executing/ }).click();
+  await expect(versions).toHaveValue('current');
+});
+
+test('activity links only current plan events and labels same-ID historical events without navigation', async ({ page }) => {
+  await start(page);
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    const s = state.snapshot;
+    const old = { ...s.plan!, id: 'plan-old', revision: 0, nodes: s.plan!.nodes.map(node => node.id === 'edit' ? { ...node, title: 'Retired adapter step', goal: 'Historical adapter contract.' } : node) };
+    const base = { taskId: s.task.id, taskRevision: 1, nodeId: 'edit', kind: 'tool.finished', createdAt: '2026-09-06T09:00:00Z' };
+    state.change({ plans: [old, ...s.plans], runs: [...s.runs, { ...s.runs[1]!, id: 'run-old', planId: old.id, status: 'succeeded' }], events: [
+      { ...base, id: 'old-explicit', seq: 3, planId: old.id, runId: 'run-old', text: 'Historical adapter output.' },
+      { ...base, id: 'old-run-bound', seq: 4, runId: 'run-old', text: 'Historical event bound through its run.' },
+      { ...base, id: 'current-event', seq: 5, planId: 'plan-1', runId: 'run-2', text: 'Current adapter output.' },
+    ] });
+  });
+  await page.getByRole('button', { name: 'Activity', exact: true }).click();
+  for (const text of ['Historical adapter output.', 'Historical event bound through its run.']) {
+    const event = page.locator('.event-row').filter({ has: page.locator('.event-copy', { hasText: text }) });
+    await event.locator(':scope > summary').click();
+    await expect(event.locator('.event-footer')).toContainText('Historical · Retired adapter step');
+    await expect(event.locator('.event-footer button')).toHaveCount(0);
+  }
+  await expect(page.getByRole('complementary', { name: 'Planning', exact: true })).toHaveCount(0);
+  const current = page.locator('.event-row').filter({ has: page.locator('.event-copy', { hasText: 'Current adapter output.' }) });
+  await current.locator(':scope > summary').click();
+  await current.getByRole('button', { name: 'Update the adapter', exact: true }).click();
+  const panel = page.getByRole('complementary', { name: 'Planning', exact: true });
+  await expect(panel.getByRole('combobox', { name: 'Plan versions', exact: true })).toHaveValue('current');
+  await expect(panel.locator('.node-detail')).toContainText('Preserve exported signatures.');
+  await expect(panel.locator('.node-detail > .detail-content > dl')).not.toContainText('Historical adapter contract.');
+  await page.getByRole('combobox', { name: 'Language', exact: true }).selectOption('zh-CN');
+  await expect(page.locator('.event-footer').filter({ hasText: '历史记录 · Retired adapter step' })).toHaveCount(2);
 });

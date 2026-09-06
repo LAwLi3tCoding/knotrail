@@ -56,7 +56,7 @@ interface DesktopAPI {
 | `task.pause` / `task.cancel` | taskId、expectedRevision | 关闭准入、等待实际收尾后暂停或取消 |
 | `task.resume` | taskId、expectedRevision | 先查证未知效果；未消费等待先观察，已有维护记录先复验，其余核对文件证据并继续 |
 | `task.inspectEffects` | taskId | 展示未知效果的绑定证据；终态任务也可查证，不启动 Run |
-| `task.previewRevision` | 新目标与 expectedRevision | 停止并生成一次性影响预览 |
+| `task.previewRevision` | expectedRevision，objective / checks 至少一项 | 停止并生成一次性影响预览；不提前更换检查 |
 | `task.previewRetry` | nodeId 与 expectedRevision | 计算本节点和后继失效集合 |
 | `task.applyImpact` | requestId 与完整签发预览 | 校验原件、版本和摘要；原子消费；继续 |
 | `decision.answer` | requestId、decisionId、答案、expectedRevision | 验证当前决定并记录回答 |
@@ -167,6 +167,10 @@ Worker 使用已固定版本的 `@earendil-works/pi-coding-agent`。项目和全
 
 acceptance、model、recovery 使用显式 kind 分派，模型不能用问题文本伪装成宿主验收。当前恢复仍依赖用户查证；没有从 diff 推断命令未发生，也没有通用 exactly-once 保证。
 
+`task.previewRevision` 与 `ImpactPreview` 的 checks 使用相同 CheckSpec 校验：最多 30 项、ID 唯一、argv 为字符串数组、保护路径不得越界。省略字段与空数组含义不同；维护任务拒绝空检查。`dispatch()` 的 `task.applyImpact` 分支校验数据库中签发的完整预览，并重新核对 TaskRevision、Plan 和工作区摘要。确认后同时更新 Task.checks 与 revisionHistory，清除当前完成资格和旧待答决定，重新进入 planning；新 Planner 不能遗漏用户检查。
+
+该事务将任务快照、impact.applied 原始预览、一次性预览消费及 requestId 一起保存。回归通过真实 SQLite 触发器使最后的请求记录写入失败，确认此前任务和预览更新均回滚，再以同一请求成功继续。这是受控事务故障，不能替代磁盘满或真实 I/O 故障实验。`report()` 的 Task revisions 段保存完整历史检查定义，回执仍绑定原任务版本与检查定义摘要。
+
 工作树创建发生在数据库提交前，因此极端崩溃可能留下未注册的工作树。v0.1 保留它而不自动删除，便于手动审查，未实现垃圾回收器。
 
 ### 持久等待与维护观察
@@ -192,6 +196,10 @@ acceptance、model、recovery 使用显式 kind 分派，模型不能用问题�
 右侧规划开关存在 AppSettings；每个任务的节点和页签选择存在 TaskPreferences。打开或关闭不触发运行，切换语言不重建任务，不翻译原始模型输出、用户输入、命令或代码。
 
 `PlanTracker` 在主对话呈现全部当前节点，以 activePlanId、TaskRevision 和 NodeState 计算已验证数量。`StepEvidence` 按节点的 runId 分离当前与历史产出；同名节点在另一版 Plan 中的记录不成为当前完成依据。`RunRecord` 用 runId + toolCallId 找到 tool.started 中的参数，并与 ActionReceipt 输出、检查和 Artifact 关联，缺失参数明确标为未记录。`DecisionRecord` 复用宿主决定文案规则，保留模型问题原文。
+
+新任务与验收编辑复用检查字段和解析；验收编辑绑定打开时的 taskId 与 revision，切换任务或新版本出现后不能把旧表单应用到当前任务。预览展示同 ID 检查的旧新标签、argv 和保护路径。历史回执、计划条件及终端命令按对应 TaskRevision 的 revisionHistory 解析，找不到历史定义时不回退成当前检查。
+
+`startRevisionOperation()` 让 Preview 与 Apply 共用操作序号、任务选择序号和 taskId 绑定。取消或开始下一次操作使旧响应失去修改弹窗和错误提示的资格；`perform()` 仍接收宿主任务快照，因此不会把界面取消误当成撤销已提交的任务修订。预览另存发起时的原始草稿，应用成功只清空仍完全相同的输入，保留后来输入的需求。
 
 计划版本选择由 App 统一持有；当前步骤入口显式选择 current，手动切换的历史版本在侧栏关闭/打开期间保留。`EventStep` 同时用于主对话与活动记录，只为当前 Plan/TaskRevision 的节点提供当前步骤入口，旧事件显示历史标签。所选节点被新版删除时给出说明，不悄悄展示另一个节点。
 

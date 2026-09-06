@@ -1,7 +1,7 @@
 import { test, expect, type Page } from '@playwright/test';
 import { readFile } from 'node:fs/promises';
 import { resolve, dirname } from 'node:path';
-import type { AppCommand, Bootstrap, TaskSnapshot } from '../src/shared/contracts';
+import type { AppCommand, Bootstrap, ImpactPreview, TaskSnapshot } from '../src/shared/contracts';
 
 // This suite verifies the real renderer against a deterministic IPC bridge.
 // Runtime, sandbox, model calls, and persistence are exercised by separate integration tests.
@@ -22,6 +22,7 @@ const fixture: TaskSnapshot = {
   actions: [{ id: 'action-1', taskId: 'task-1', runId: 'run-2', nodeId: 'edit', toolCallId: 'call-1', name: 'read', argsDigest: 'args-1', status: 'succeeded', output: 'export function adapter(input) {}', startedAt: now }], checks: [], decisions: [], lastSequence: 2,
 };
 fixture.plans = [fixture.plan!];
+fixture.task.revisionHistory[0]!.checks = structuredClone(fixture.task.checks);
 
 async function start(page: Page) {
   await page.route('https://knotrail.test/**', async route => {
@@ -34,10 +35,12 @@ async function start(page: Page) {
     const boot: Bootstrap = { projects: [{ id: 'project-1', name: 'adapter-project', path: 'project', createdAt }], tasks: [data.task], settings: { locale: 'en', planningOpen: false, model: { baseUrl: 'https://example.invalid/v1', modelId: 'test-model', thinking: 'high', contextWindow: 128000, maxTokens: 4096, hasApiKey: true }, responseLanguage: 'task', allowNetwork: false }, capabilities: { sandbox: true, platform: 'test' }, version: '0.1.0' };
     const listeners: ((event: { taskId?: string; kind: string }) => void)[] = [];
     const commands: AppCommand[] = [];
+    const previews: ImpactPreview[] = [];
     const preferences: Record<string, unknown> = {};
     const notify = () => listeners.forEach(listener => listener({ taskId: data.task.id, kind: 'changed' }));
     Object.assign(window, { uiTest: {
       commands,
+      previews,
       change: (patch: Partial<TaskSnapshot>) => { Object.assign(data, patch); data.lastSequence++; boot.tasks[0] = data.task; notify(); },
       snapshot: data,
     } });
@@ -61,9 +64,22 @@ async function start(page: Page) {
             case 'task.pause': data.task.status = 'paused'; data.lastSequence++; notify(); return data;
             case 'task.resume': data.task.status = 'executing'; data.lastSequence++; notify(); return data;
             case 'task.cancel': data.task.status = 'cancelled'; data.lastSequence++; notify(); return data;
-            case 'task.previewRevision': return { id: 'impact-fixture', taskId: data.task.id, expectedRevision: data.task.revision, expectedPlanId: data.plan?.id, workspaceDigest: 'workspace', objective: command.objective, affected: ['edit', 'verify'], retained: ['research'], reason: 'Legacy configuration support changes adapter and checks.' };
+            case 'task.previewRevision': {
+              if (command.taskId !== data.task.id || command.expectedRevision !== data.task.revision) throw new Error('Task revision changed');
+              if (data.task.mode === 'maintain' && command.checks?.length === 0) throw new Error('Maintenance requires at least one fixed acceptance check');
+              const preview: ImpactPreview = { id: `impact-fixture-${previews.length}`, taskId: data.task.id, expectedRevision: data.task.revision, expectedPlanId: data.plan?.id, workspaceDigest: 'workspace', ...(command.objective !== undefined ? { objective: command.objective } : {}), ...(command.checks !== undefined ? { checks: command.checks } : {}), affected: data.plan?.nodes.map(node => node.id) ?? [], retained: [], reason: command.checks !== undefined ? 'Acceptance checks changed: previous results remain historical; the revised task must be planned and verified again.' : 'Legacy configuration support changes adapter and checks.' };
+              previews.push(structuredClone(preview)); data.task.status = 'paused'; data.lastSequence++; notify(); return preview;
+            }
             case 'task.previewRetry': return { id: 'retry-fixture', taskId: data.task.id, expectedRevision: data.task.revision, expectedPlanId: data.plan?.id, workspaceDigest: 'workspace', nodeId: command.nodeId, affected: [command.nodeId], retained: [], reason: 'The selected step must run again.' };
-            case 'task.applyImpact': data.task.revision++; if (command.preview.objective) data.task.objective = command.preview.objective; data.lastSequence++; notify(); return data;
+            case 'task.applyImpact': {
+              if (!previews.some(preview => JSON.stringify(preview) === JSON.stringify(command.preview))) throw new Error('Impact preview is stale or was not issued by this host');
+              data.task.revision++;
+              if (command.preview.objective !== undefined) data.task.objective = command.preview.objective;
+              if (command.preview.checks !== undefined) data.task.checks = structuredClone(command.preview.checks);
+              data.task.revisionHistory.push({ revision: data.task.revision, objective: data.task.objective, checks: structuredClone(data.task.checks), createdAt });
+              if (data.plan) { data.plan = { ...data.plan, id: `plan-${data.task.revision}`, revision: data.plan.revision + 1, taskRevision: data.task.revision }; data.plans.push(data.plan); data.task.activePlanId = data.plan.id; }
+              data.task.status = 'ready'; data.nodes = data.nodes.map(node => ({ nodeId: node.nodeId, status: 'queued', attempt: 0 })); data.lastSequence++; notify(); return data;
+            }
             case 'task.inspectEffects': {
               data.decisions.push({ id: 'terminal-recovery', kind: 'recovery', taskId: data.task.id, taskRevision: data.task.revision, planId: data.plan?.id, question: 'Inspect unknown terminal effects.', options: ['preserve-and-stop'], recovery: { actionIds: ['action-1'], actionsDigest: 'actions-digest', workspaceDigest: 'workspace-digest', artifactId: 'artifact-1', terminalStatus: 'cancelled' }, createdAt });
               data.lastSequence++; notify(); return data;
@@ -84,6 +100,21 @@ async function start(page: Page) {
   await page.goto(appUrl);
   await page.getByRole('button', { name: /Upgrade the adapter/ }).click();
   await expect(page.getByRole('heading', { name: 'Upgrade the adapter' })).toBeVisible();
+}
+
+async function delayRevisionResponses(page: Page, commandType: 'task.previewRevision' | 'task.applyImpact' = 'task.previewRevision') {
+  await page.evaluate(commandType => {
+    const pending: { resolve: () => void; reject: (error: Error) => void }[] = [];
+    const state = (window as unknown as { uiTest: object }).uiTest;
+    Object.assign(state, { pendingRevisions: pending, settleRevision: (index: number, error?: string) => error ? pending[index]!.reject(new Error(error)) : pending[index]!.resolve() });
+    const original = window.knotrail.command;
+    window.knotrail.command = async <T,>(command: AppCommand): Promise<T> => {
+      // Host state and notifications precede the delayed command response.
+      const result = await original<T>(command);
+      if (command.type === commandType) await new Promise<void>((resolve, reject) => pending.push({ resolve, reject }));
+      return result;
+    };
+  }, commandType);
 }
 
 test('planning stays on the right and observes updates while hidden; locale and view changes preserve drafts', async ({ page }) => {
@@ -161,6 +192,303 @@ test('new tasks send typed checks, settings save and test a real bridge command,
   const commands = await page.evaluate(() => (window as unknown as { uiTest: { commands: AppCommand[] } }).uiTest.commands);
   expect(commands.find(command => command.type === 'task.create')).toMatchObject({ checks: [{ command: ['npm', 'test', '--', 'api'], protectedPaths: ['test/api.test.ts'] }], executionPolicy: 'reviewBeforeExecute' });
   expect(commands.some(command => command.type === 'model.check')).toBe(true);
+});
+
+test('fixed acceptance edits preview every changed field, preserve cancellation and apply the exact host preview', async ({ page }) => {
+  await start(page);
+  await page.getByRole('textbox', { name: 'Describe a requirement change…' }).fill('Keep this unsent requirement draft.');
+  await page.getByRole('button', { name: 'Edit checks', exact: true }).click();
+  const editor = page.getByRole('dialog', { name: 'Edit checks', exact: true });
+  await editor.getByLabel('Check label', { exact: true }).fill('Discard this local edit');
+  await editor.getByRole('button', { name: 'Cancel editing', exact: true }).click();
+  expect(await page.evaluate(() => (window as unknown as { uiTest: { commands: AppCommand[] } }).uiTest.commands.some(command => command.type === 'task.previewRevision'))).toBe(false);
+  for (const apply of [false, true]) {
+    await page.getByRole('button', { name: 'Edit checks', exact: true }).click();
+    await expect(editor.getByLabel('Check label', { exact: true })).toHaveValue('API tests');
+    await editor.getByLabel('Check label', { exact: true }).fill('Contract checks');
+    await editor.getByLabel('Command argv (JSON array)').fill('["npm","run","verify:contract"]');
+    await editor.getByLabel('Protected paths (one per line)').fill('test/contracts.test.ts\npackage.json');
+    await editor.getByRole('button', { name: 'Preview impact', exact: true }).click();
+    const preview = page.getByRole('dialog', { name: 'Review impact', exact: true });
+    await expect(preview.locator('.check-change > h4 > code')).toHaveText('test');
+    await expect(preview.getByText('Changed', { exact: true })).toBeVisible();
+    const before = preview.getByRole('region', { name: 'Before', exact: true });
+    const after = preview.getByRole('region', { name: 'After', exact: true });
+    await expect(before).toContainText('API tests');
+    await expect(before).toContainText('["npm","test"]');
+    await expect(before).toContainText('test/api.test.ts');
+    await expect(after).toContainText('Contract checks');
+    await expect(after).toContainText('["npm","run","verify:contract"]');
+    await expect(after).toContainText('test/contracts.test.ts');
+    await expect(after).toContainText('package.json');
+    await expect(preview).toContainText('Inspect callers');
+    await expect(preview).toContainText('Verify public APIs');
+    const pending = await page.evaluate(() => (window as unknown as { uiTest: { snapshot: TaskSnapshot; commands: AppCommand[] } }).uiTest);
+    expect(pending.snapshot.task.checks).toEqual(fixture.task.checks);
+    expect(pending.snapshot.task.status).toBe('paused');
+    expect(pending.commands.some(command => command.type === 'task.applyImpact')).toBe(false);
+    await preview.getByRole('button', { name: apply ? 'Apply and continue' : 'Dismiss', exact: true }).click();
+    await expect(preview).toHaveCount(0);
+  }
+  const state = await page.evaluate(() => (window as unknown as { uiTest: { snapshot: TaskSnapshot; commands: AppCommand[]; previews: ImpactPreview[] } }).uiTest);
+  const applied = state.commands.filter(command => command.type === 'task.applyImpact');
+  expect(applied).toHaveLength(1);
+  expect(applied[0]!.preview).toEqual(state.previews.at(-1));
+  expect(state.previews.at(-1)).toMatchObject({ taskId: 'task-1', expectedRevision: 1, checks: [{ id: 'test', label: 'Contract checks', command: ['npm', 'run', 'verify:contract'], protectedPaths: ['test/contracts.test.ts', 'package.json'] }] });
+  expect(state.previews.at(-1)).not.toHaveProperty('objective');
+  expect(state.snapshot.task.revision).toBe(2);
+  await expect(page.getByRole('textbox', { name: 'Describe a requirement change…' })).toHaveValue('Keep this unsent requirement draft.');
+});
+
+test('historical check receipts, plan conditions and terminal commands resolve their own task revision', async ({ page }) => {
+  await start(page);
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    const s = state.snapshot;
+    const checks = [{ id: 'test', label: 'Contract checks', command: ['npm', 'run', 'verify:contract'], protectedPaths: ['test/contracts.test.ts'] }];
+    const plan = { ...s.plan!, id: 'plan-2', taskRevision: 2, revision: 2 };
+    state.change({ task: { ...s.task, revision: 2, activePlanId: 'plan-2', checks, revisionHistory: [...s.task.revisionHistory, { revision: 2, objective: s.task.objective, checks, createdAt: s.task.updatedAt }] }, plan, plans: [...s.plans, plan], checks: [
+      { id: 'old-check', conditionId: 'test', taskId: s.task.id, taskRevision: 1, planId: 'plan-1', runId: 'run-2', nodeId: 'edit', batchId: 'batch-old', scope: 'node', checksDigest: 'old-definition', result: 'pass', inputDigest: 'old-input', output: 'Historical API output', checkedAt: s.task.updatedAt },
+      { id: 'legacy-check', conditionId: 'test', taskId: s.task.id, runId: 'run-2', nodeId: 'edit', result: 'pass', inputDigest: 'legacy-input', output: 'Legacy output without a revision', checkedAt: s.task.updatedAt },
+    ] });
+  });
+  await page.getByRole('button', { name: 'Planning', exact: true }).click();
+  const planning = page.getByRole('complementary', { name: 'Planning', exact: true });
+  await expect(planning.locator('.conditions')).toContainText('Contract checks');
+  await planning.getByRole('button', { name: 'Steps', exact: true }).click();
+  await planning.getByLabel('Plan versions').selectOption('plan-1');
+  await planning.getByRole('button', { name: /Update the adapter.*Historical plan/ }).click();
+  await expect(planning.locator('.detail-content > dl')).toContainText('API tests');
+  await expect(planning.locator('.detail-content > dl')).not.toContainText('Contract checks');
+  await planning.getByRole('button', { name: 'Checks', exact: true }).click();
+  const old = planning.locator('.receipt').filter({ hasText: 'Historical API output' });
+  await expect(old.locator(':scope > summary')).toContainText('API tests');
+  await old.locator(':scope > summary').click();
+  await expect(old.locator('.check-definition')).toContainText('["npm","test"]');
+  await expect(old.locator('.check-definition')).toContainText('test/api.test.ts');
+  await expect(old).not.toContainText('Contract checks');
+  const legacy = planning.locator('.receipt').filter({ hasText: 'Legacy output without a revision' });
+  await expect(legacy.locator(':scope > summary')).toContainText('test');
+  await expect(legacy.locator(':scope > summary')).not.toContainText('Contract checks');
+  await legacy.locator(':scope > summary').click();
+  await expect(legacy).toContainText('Check definitions were not recorded for this revision.');
+  await planning.getByRole('button', { name: 'Process', exact: true }).click();
+  await planning.locator('.conditions summary').click();
+  await expect(planning.locator('.conditions')).toContainText('API tests');
+  await expect(planning.locator('.conditions')).toContainText('["npm","test"]');
+  await expect(planning.locator('.conditions')).not.toContainText('Contract checks');
+  await page.getByRole('button', { name: 'Close planning', exact: true }).click();
+  await page.getByRole('button', { name: 'Terminal', exact: true }).click();
+  const terminalOld = page.locator('.terminal-record').filter({ hasText: 'Historical API output' });
+  await expect(terminalOld.locator('summary')).toContainText('npm test');
+  await expect(terminalOld.locator('summary')).not.toContainText('verify:contract');
+  const terminalLegacy = page.locator('.terminal-record').filter({ hasText: 'Legacy output without a revision' });
+  await expect(terminalLegacy.locator('summary')).toContainText('test · Not recorded');
+  await page.getByRole('combobox', { name: 'Language', exact: true }).selectOption('zh-CN');
+  await expect(terminalLegacy.locator('summary')).toContainText('test · 未记录');
+  await page.locator('.task-revisions > summary').click();
+  const original = page.locator('.task-revisions > details').first();
+  await original.locator(':scope > summary').click();
+  await expect(original).toContainText('API tests');
+  await expect(original).not.toContainText('Contract checks');
+});
+
+test('stale acceptance editors cannot submit and a delayed preview cannot target a newly selected task', async ({ page }) => {
+  await start(page);
+  await delayRevisionResponses(page);
+  await page.getByRole('button', { name: 'Edit checks', exact: true }).click();
+  const editor = page.getByRole('dialog', { name: 'Edit checks', exact: true });
+  await editor.getByLabel('Check label', { exact: true }).fill('An old draft');
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, revision: 2, checks: [{ ...state.snapshot.task.checks[0]!, label: 'Updated elsewhere' }] } });
+  });
+  await expect(editor.getByRole('alert')).toContainText('This task has changed');
+  await expect(editor.getByLabel('Check label', { exact: true })).toHaveValue('An old draft');
+  await expect(editor.getByRole('button', { name: 'Preview impact', exact: true })).toBeDisabled();
+  expect(await page.evaluate(() => (window as unknown as { uiTest: { commands: AppCommand[] } }).uiTest.commands.some(command => command.type === 'task.previewRevision'))).toBe(false);
+  await editor.getByRole('button', { name: 'Cancel editing', exact: true }).click();
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    const original = window.knotrail.command;
+    const second = structuredClone(state.snapshot); second.task = { ...second.task, id: 'task-2', title: 'Another task' };
+    window.knotrail.command = async <T,>(command: AppCommand): Promise<T> => {
+      if (command.type === 'task.snapshot' && command.taskId === 'task-2') return structuredClone(second) as T;
+      const result = await original<T>(command);
+      if (command.type === 'bootstrap') return { ...(result as Bootstrap), tasks: [...(result as Bootstrap).tasks, second.task] } as T;
+      return result;
+    };
+    state.change({});
+  });
+  await page.getByRole('button', { name: 'Edit checks', exact: true }).click();
+  await expect(editor.getByLabel('Check label', { exact: true })).toHaveValue('Updated elsewhere');
+  await editor.getByLabel('Check label', { exact: true }).fill('Bound to the first task');
+  await editor.getByRole('button', { name: 'Preview impact', exact: true }).click();
+  await editor.getByRole('button', { name: 'Cancel editing', exact: true }).click();
+  await page.getByRole('button', { name: /Another task/ }).click();
+  await expect(page.getByRole('heading', { name: 'Another task', exact: true })).toBeVisible();
+  await page.evaluate(() => (window as unknown as { uiTest: { settleRevision: (index: number) => void } }).uiTest.settleRevision(0));
+  await expect(page.getByRole('button', { name: 'Edit checks', exact: true })).toBeEnabled();
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  const commands = await page.evaluate(() => (window as unknown as { uiTest: { commands: AppCommand[] } }).uiTest.commands);
+  expect(commands.filter(command => command.type === 'task.previewRevision')).toMatchObject([{ taskId: 'task-1', expectedRevision: 2, checks: [{ label: 'Bound to the first task' }] }]);
+  expect(commands.some(command => command.type === 'task.applyImpact')).toBe(false);
+});
+
+test('all acceptance editor exits discard late responses while preserving the host pause', async ({ page }) => {
+  await start(page);
+  await delayRevisionResponses(page);
+  for (const [index, exit] of ['Cancel editing', 'Escape', 'Close'].entries()) {
+    await page.getByRole('button', { name: 'Edit checks', exact: true }).click();
+    const editor = page.getByRole('dialog', { name: 'Edit checks', exact: true });
+    await editor.getByLabel('Check label', { exact: true }).fill(`Discarded by ${exit}`);
+    await editor.getByRole('button', { name: 'Preview impact', exact: true }).click();
+    if (exit === 'Escape') await page.keyboard.press('Escape');
+    else await editor.getByRole('button', { name: exit, exact: true }).click();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await page.evaluate(({ index, reject }) => (window as unknown as { uiTest: { settleRevision: (index: number, error?: string) => void } }).uiTest.settleRevision(index, reject ? 'Discarded preview failure' : undefined), { index, reject: exit === 'Close' });
+    await expect(page.getByRole('button', { name: 'Edit checks', exact: true })).toBeEnabled();
+    await expect(page.getByRole('dialog')).toHaveCount(0);
+    await expect(page.getByRole('alert')).toHaveCount(0);
+  }
+  const state = await page.evaluate(() => (window as unknown as { uiTest: { snapshot: TaskSnapshot; commands: AppCommand[] } }).uiTest);
+  expect(state.snapshot.task.checks).toEqual(fixture.task.checks);
+  expect(state.snapshot.task.status).toBe('paused');
+  expect(state.commands.filter(command => command.type === 'task.previewRevision')).toHaveLength(3);
+  expect(state.commands.some(command => command.type === 'task.applyImpact' || command.type === 'task.resume')).toBe(false);
+});
+
+for (const outcome of ['success', 'failure'] as const) test(`a discarded acceptance preview ${outcome} cannot replace a later requirement preview`, async ({ page }) => {
+  await start(page);
+  await delayRevisionResponses(page);
+  await page.getByRole('button', { name: 'Edit checks', exact: true }).click();
+  const editor = page.getByRole('dialog', { name: 'Edit checks', exact: true });
+  await editor.getByLabel('Check label', { exact: true }).fill('Discarded acceptance draft');
+  await editor.getByRole('button', { name: 'Preview impact', exact: true }).click();
+  await editor.getByRole('button', { name: 'Cancel editing', exact: true }).click();
+  const draft = page.getByRole('textbox', { name: 'Describe a requirement change…' });
+  await draft.fill('A later requirement draft');
+  await draft.press('Control+Enter');
+  await expect.poll(() => page.evaluate(() => (window as unknown as { uiTest: { pendingRevisions: unknown[] } }).uiTest.pendingRevisions.length)).toBe(2);
+  await page.evaluate(() => (window as unknown as { uiTest: { settleRevision: (index: number) => void } }).uiTest.settleRevision(1));
+  const preview = page.getByRole('dialog', { name: 'Review impact', exact: true });
+  await expect(preview).toBeVisible();
+  await page.evaluate(outcome => (window as unknown as { uiTest: { settleRevision: (index: number, error?: string) => void } }).uiTest.settleRevision(0, outcome === 'failure' ? 'Old acceptance preview failure' : undefined), outcome);
+  await expect(preview.getByRole('button', { name: 'Apply and continue', exact: true })).toBeEnabled();
+  await expect(preview.locator('.check-comparison')).toHaveCount(0);
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await preview.getByRole('button', { name: 'Apply and continue', exact: true }).click();
+  const state = await page.evaluate(() => (window as unknown as { uiTest: { snapshot: TaskSnapshot; commands: AppCommand[]; previews: ImpactPreview[] } }).uiTest);
+  const applied = state.commands.filter(command => command.type === 'task.applyImpact');
+  expect(applied).toHaveLength(1);
+  expect(applied[0]!.preview).toEqual(state.previews[1]);
+  expect(state.snapshot.task.objective).toContain('A later requirement draft');
+  expect(state.snapshot.task.checks).toEqual(fixture.task.checks);
+});
+
+for (const outcome of ['success', 'failure'] as const) test(`a dismissed Apply ${outcome} cannot close a newer preview or clear its draft`, async ({ page }) => {
+  await start(page);
+  await delayRevisionResponses(page, 'task.applyImpact');
+  const composer = page.getByRole('textbox', { name: 'Describe a requirement change…' });
+  await composer.fill('First accepted requirement');
+  await composer.press('Control+Enter');
+  const preview = page.getByRole('dialog', { name: 'Review impact', exact: true });
+  await preview.getByRole('button', { name: 'Apply and continue', exact: true }).click();
+  await preview.getByRole('button', { name: 'Dismiss', exact: true }).click();
+  await expect(page.locator('.subtitle')).toContainText('Version 2');
+  await composer.fill('Keep this newer requirement draft');
+  await composer.press('Control+Enter');
+  await expect(preview).toContainText('Task revision 2');
+  await page.evaluate(outcome => (window as unknown as { uiTest: { settleRevision: (index: number, error?: string) => void } }).uiTest.settleRevision(0, outcome === 'failure' ? 'Earlier Apply response failed' : undefined), outcome);
+  await expect(preview.getByRole('button', { name: 'Apply and continue', exact: true })).toBeEnabled();
+  await expect(composer).toHaveValue('Keep this newer requirement draft');
+  await expect(page.getByRole('alert')).toHaveCount(0);
+  await expect(page.locator('.titlebar .status')).toHaveText('Paused');
+  await preview.getByRole('button', { name: 'Apply and continue', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { uiTest: { pendingRevisions: unknown[] } }).uiTest.pendingRevisions.length)).toBe(2);
+  await page.evaluate(() => (window as unknown as { uiTest: { settleRevision: (index: number) => void } }).uiTest.settleRevision(1));
+  await expect(preview).toHaveCount(0);
+  await expect(composer).toHaveValue('');
+  const state = await page.evaluate(() => (window as unknown as { uiTest: { snapshot: TaskSnapshot; commands: AppCommand[]; previews: ImpactPreview[] } }).uiTest);
+  expect(state.snapshot.task.revision).toBe(3);
+  expect(state.commands.filter(command => command.type === 'task.applyImpact').map(command => command.preview)).toEqual(state.previews);
+  expect(state.snapshot.task.checks).toEqual(fixture.task.checks);
+});
+
+test('applying a requirement preserves text entered while its preview response was pending', async ({ page }) => {
+  await start(page);
+  await delayRevisionResponses(page);
+  const composer = page.getByRole('textbox', { name: 'Describe a requirement change…' });
+  await composer.fill('The requirement being submitted');
+  await composer.press('Control+Enter');
+  await composer.fill('Later text that has not been submitted');
+  await page.evaluate(() => (window as unknown as { uiTest: { settleRevision: (index: number) => void } }).uiTest.settleRevision(0));
+  const preview = page.getByRole('dialog', { name: 'Review impact', exact: true });
+  await preview.getByRole('button', { name: 'Apply and continue', exact: true }).click();
+  await expect(preview).toHaveCount(0);
+  await expect(composer).toHaveValue('Later text that has not been submitted');
+  const state = await page.evaluate(() => (window as unknown as { uiTest: { snapshot: TaskSnapshot; commands: AppCommand[] } }).uiTest);
+  expect(state.snapshot.task.revision).toBe(2);
+  expect(state.snapshot.task.objective).toContain('The requirement being submitted');
+  expect(state.snapshot.task.objective).not.toContain('Later text that has not been submitted');
+});
+
+test('acceptance removal explains manual review, maintenance keeps a check, and host errors remain visible in the bilingual narrow editor', async ({ page }) => {
+  await start(page);
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, mode: 'maintain', status: 'healthy' } });
+  });
+  await expect(page.locator('.titlebar .status')).toHaveText('Healthy');
+  await page.getByRole('button', { name: 'Edit checks', exact: true }).click();
+  let editor = page.getByRole('dialog', { name: 'Edit checks', exact: true });
+  await editor.getByRole('button', { name: 'Remove check 1', exact: true }).click();
+  await expect(editor.getByRole('alert')).toHaveText('Maintenance requires at least one fixed acceptance check');
+  await expect(editor.getByRole('button', { name: 'Preview impact', exact: true })).toBeDisabled();
+  await expect(editor).not.toContainText('Completion will require your acceptance.');
+  await editor.getByRole('button', { name: 'Cancel editing', exact: true }).click();
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, mode: 'once', status: 'paused' } });
+  });
+  await expect(page.locator('.titlebar .status')).toHaveText('Paused');
+  await page.getByRole('combobox', { name: 'Language', exact: true }).selectOption('zh-CN');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator('.sidebar').getByRole('button', { name: '收起导航', exact: true }).click();
+  await page.getByRole('button', { name: '编辑验收', exact: true }).click();
+  editor = page.getByRole('dialog', { name: '编辑验收', exact: true });
+  await editor.getByRole('button', { name: '移除检查 1', exact: true }).click();
+  await editor.getByRole('button', { name: '预览影响', exact: true }).click();
+  const preview = page.getByRole('dialog', { name: '审阅影响', exact: true });
+  await expect(preview).toContainText('将移除全部自动检查。任务完成将改为由你人工验收结果。');
+  await expect(preview).toContainText('新版本必须重新规划并验证');
+  await expect(preview.getByRole('region', { name: '修改前', exact: true })).toContainText('API tests');
+  await expect(preview.getByRole('region', { name: '修改后', exact: true })).toContainText('无');
+  expect(await preview.evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+  await page.keyboard.press('Shift+Tab');
+  expect(await preview.evaluate(element => element.contains(document.activeElement))).toBe(true);
+  await page.screenshot({ path: test.info().outputPath('acceptance-removal-zh-narrow.png') });
+  await page.keyboard.press('Escape');
+  await expect(preview).toHaveCount(0);
+  await page.getByRole('button', { name: '编辑验收', exact: true }).click();
+  await editor.getByLabel('命令参数（JSON 数组）').fill('[1]');
+  await editor.getByRole('button', { name: '预览影响', exact: true }).click();
+  await expect(editor.getByRole('alert')).toHaveText('每条命令必须是非空字符串组成的 JSON 数组。');
+  await editor.getByLabel('命令参数（JSON 数组）').fill('["npm","test","--","contract"]');
+  await page.evaluate(() => {
+    const original = window.knotrail.command;
+    window.knotrail.command = async <T,>(command: AppCommand): Promise<T> => {
+      if (command.type === 'task.previewRevision') throw new Error('Workspace inspection failed for acceptance preview');
+      return original<T>(command);
+    };
+  });
+  await editor.getByRole('button', { name: '预览影响', exact: true }).click();
+  await expect(editor.getByRole('alert')).toHaveText('Workspace inspection failed for acceptance preview');
+  await expect(editor.getByLabel('命令参数（JSON 数组）')).toHaveValue('["npm","test","--","contract"]');
+  const state = await page.evaluate(() => (window as unknown as { uiTest: { snapshot: TaskSnapshot; commands: AppCommand[] } }).uiTest);
+  expect(state.snapshot.task.checks).toEqual(fixture.task.checks);
+  expect(state.commands.filter(command => command.type === 'task.previewRevision')).toMatchObject([{ checks: [] }]);
+  expect(state.commands.some(command => command.type === 'task.applyImpact')).toBe(false);
 });
 
 test('narrow screens use a right drawer with keyboard containment, no horizontal overflow, and accessible navigation', async ({ page }) => {

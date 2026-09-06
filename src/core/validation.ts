@@ -6,13 +6,13 @@ export const checksSchema=z.array(z.object({id:key,label:text,command:z.array(z.
 export const waitSchema=z.object({kind:z.literal('wait'),reason:text,minutes:z.number().int().min(1).max(43200),source:z.object({kind:z.enum(['workspace_file','project_file']),path}).strict(),condition:z.union([z.object({kind:z.enum(['changed','exists'])}).strict(),z.object({kind:z.literal('contains'),text:z.string().min(1).max(4096)}).strict()])}).strict();
 const secret=z.string().max(8192);
 const prefs=z.object({panelView:z.enum(['process','steps']),selectedNode:key.optional(),detailTab:z.enum(['overview','artifacts','checks','history']),mainView:z.enum(['chat','activity','changes']),toolPanel:z.enum(['files','terminal','preview']).nullable(),graphView:z.enum(['graph','list']),draft:z.string().max(32_000)}).strict();
-const impact=z.object({id:key,taskId:key,expectedRevision:revision,expectedPlanId:key.optional(),workspaceDigest:key,objective:text.optional(),nodeId:key.optional(),affected:z.array(key),retained:z.array(key),reason:text}).strict();
+const impact=z.object({id:key,taskId:key,expectedRevision:revision,expectedPlanId:key.optional(),workspaceDigest:key,objective:text.optional(),checks:checksSchema.optional(),nodeId:key.optional(),affected:z.array(key),retained:z.array(key),reason:text}).strict();
 const schemas:Record<string,z.ZodType>={
  'bootstrap':z.object({type:z.literal('bootstrap')}).strict(),
  'project.add':z.object({type:z.literal('project.add'),path:text}).strict(),
  'task.create':z.object({type:z.literal('task.create'),requestId:key,projectId:key,objective:text,checks:checksSchema,executionPolicy:z.enum(['autoWithinGrant','reviewBeforeExecute']),mode:z.enum(['once','finite','maintain']),intervalMinutes:z.number().int().min(1).max(43200).optional(),maxTurns:z.number().int().min(1).max(500).optional(),maxRunMs:z.number().int().min(1000).max(3600000).optional(),expiresAt:z.iso.datetime().optional()}).strict(),
  'task.applyImpact':z.object({type:z.literal('task.applyImpact'),requestId:key,preview:impact}).strict(),
- 'task.previewRevision':z.object({type:z.literal('task.previewRevision'),taskId:key,objective:text,expectedRevision:revision}).strict(),
+ 'task.previewRevision':z.object({type:z.literal('task.previewRevision'),taskId:key,objective:text.optional(),checks:checksSchema.optional(),expectedRevision:revision}).strict().refine(v=>v.objective!==undefined||v.checks!==undefined,'Provide a revised objective or acceptance checks'),
  'task.previewRetry':z.object({type:z.literal('task.previewRetry'),taskId:key,nodeId:key,expectedRevision:revision}).strict(),
  'decision.answer':z.object({type:z.literal('decision.answer'),requestId:key,taskId:key,decisionId:key,answer:text,expectedRevision:revision}).strict(),
  'task.readFile':z.object({type:z.literal('task.readFile'),taskId:key,path}).strict(),

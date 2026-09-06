@@ -25,6 +25,9 @@ const draft = {
 const responses = [
   { name: 'read_file', args: { path: 'target.txt' }, text: 'Inspecting the file before planning.' },
   { name: 'update_plan', args: { draft, submit: true }, text: 'The plan is ready for review.' },
+  { name: 'read_file', args: { path: 'expected.txt' }, text: 'Reviewing the revised acceptance conditions.' },
+  { name: 'update_plan', args: { draft: { ...draft, summary: 'Replan against the revised fixed comparison and protected files' }, submit: true }, text: 'The revised plan is ready for review.' },
+  { name: 'write_file', args: { path: 'contract.txt', content: 'must be denied\n', expectedContent: 'fixed contract\n' } },
   { name: 'read_file', args: { path: 'target.txt' }, text: 'Checking the current file before editing.' },
   { name: 'write_file', args: { path: 'target.txt', content: 'verified result\n', expectedContent: 'before\n' } },
   { name: 'outcome', args: { kind: 'complete', summary: 'Updated target.txt; independent comparison is ready.' } },
@@ -53,8 +56,10 @@ try {
   await mkdir(source);
   await writeFile(join(source, 'target.txt'), 'before\n');
   await writeFile(join(source, 'expected.txt'), 'verified result\n');
+  if (!live) await writeFile(join(source, 'contract.txt'), 'fixed contract\n');
   const git = args => execFileSync('/usr/bin/git', args, { cwd: source, stdio: 'pipe' });
   git(['init', '-q']); git(['add', 'target.txt', 'expected.txt']);
+  if (!live) git(['add', 'contract.txt']);
   git(['-c', 'user.name=Knotrail Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-q', '-m', 'Fixture baseline']);
   if (!live) await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
   const baseUrl = live ? 'https://chatgpt.com/backend-api' : `http://127.0.0.1:${server.address().port}/v1`;
@@ -122,23 +127,53 @@ try {
   await expect(page.getByRole('button', { name: '规划', exact: true })).toBeVisible();
   await page.locator('.language-control select').selectOption('en');
   await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+  if (!live) {
+    const originalChecks = structuredClone(snapshot.task.checks);
+    const originalPlan = snapshot.task.activePlanId;
+    await page.getByRole('button', { name: 'Edit checks', exact: true }).click();
+    const editor = page.getByRole('dialog', { name: 'Edit checks', exact: true });
+    await editor.getByLabel('Check label', { exact: true }).fill('Compare the revised result');
+    await editor.getByLabel('Command argv (JSON array)', { exact: true }).fill('["/usr/bin/cmp","expected.txt","target.txt"]');
+    await editor.getByLabel('Protected paths (one per line)', { exact: true }).fill('expected.txt\ncontract.txt');
+    await editor.getByRole('button', { name: 'Preview impact', exact: true }).click();
+    const preview = page.getByRole('dialog', { name: 'Review impact', exact: true });
+    await expect(preview.locator('section[aria-label="Before"]')).toContainText('Compare the result');
+    await expect(preview.locator('section[aria-label="After"]')).toContainText('Compare the revised result');
+    assert.deepEqual((await command({ type: 'task.snapshot', taskId })).task.checks, originalChecks);
+    await preview.getByRole('button', { name: 'Apply and continue', exact: true }).click();
+    await until('ready');
+    assert.equal(snapshot.task.revision, 2);
+    assert.notEqual(snapshot.task.activePlanId, originalPlan);
+    assert.deepEqual(snapshot.task.checks, [{ id: 'compare', label: 'Compare the revised result', command: ['/usr/bin/cmp', 'expected.txt', 'target.txt'], protectedPaths: ['expected.txt', 'contract.txt'] }]);
+    assert.deepEqual(snapshot.task.revisionHistory[0].checks, originalChecks);
+    assert.equal(snapshot.plans.length, 2);
+    assert.equal(snapshot.actions.filter(action => action.name === 'write_file').length, 0);
+    assert.equal(await readFile(join(snapshot.task.workdir, 'target.txt'), 'utf8'), 'before\n');
+    assert.match(JSON.stringify(requests[2].messages), /Compare the revised result/);
+  }
   await page.getByRole('button', { name: 'Start execution', exact: true }).click();
   await until('completed');
   assert.equal(await readFile(join(snapshot.task.workdir, 'target.txt'), 'utf8'), 'verified result\n');
   assert.equal(await readFile(join(source, 'target.txt'), 'utf8'), 'before\n');
-  assert.equal(snapshot.runs.length, 2);
+  assert.equal(snapshot.runs.length, live ? 2 : 3);
   assert.ok(snapshot.checks.length >= 2 && snapshot.checks.every(check => check.result === 'pass'));
   assert.equal(snapshot.nodes[0].status, 'verified');
   assert.ok(snapshot.artifacts.some(artifact => artifact.content.includes('verified result')));
   assert.deepEqual(snapshot.events.map(event => event.seq), Array.from({ length: snapshot.events.length }, (_, index) => index + 1));
-  if (!live) assert.equal(requests.length, responses.length);
+  if (!live) {
+    assert.equal(requests.length, responses.length);
+    assert.deepEqual(snapshot.actions.filter(action => action.name === 'write_file').map(action => action.status), ['failed', 'succeeded']);
+    assert.equal(await readFile(join(snapshot.task.workdir, 'contract.txt'), 'utf8'), 'fixed contract\n');
+    assert.ok(snapshot.checks.every(check => check.taskRevision === 2 && check.planId === snapshot.task.activePlanId));
+  }
   assert.equal((await command({ type: 'task.readFile', taskId, path: 'target.txt' })).content, 'verified result\n');
   await assert.rejects(command({ type: 'task.readFile', taskId, path: '../model-key.enc' }));
   const report = await command({ type: 'task.export', taskId });
   assert.match(await readFile(report.path, 'utf8'), /Status: completed/);
+  if (!live) assert.match(await readFile(report.path, 'utf8'), /## Task revisions[\s\S]+Compare the result[\s\S]+Compare the revised result/);
   assert.deepEqual(errors, [], 'Renderer should not have console or page errors');
   if (process.env.KNOTRAIL_SMOKE_SCREENSHOT) await page.screenshot({ path: process.env.KNOTRAIL_SMOKE_SCREENSHOT });
-  console.log(JSON.stringify({ result: 'passed', packaged: !!process.env.KNOTRAIL_ELECTRON_EXECUTABLE, model: live ? modelId : 'scripted loopback provider through real pi SDK', authSource: live ? 'codex-login' : 'api-key', planningBeforeExecution: true, verifiedChecks: snapshot.checks.length, rightPlanningPanel: true, planTracker: true, languages: ['en', 'zh-CN'], isolatedWorktree: true, encryptedCredentialStorage: true, credentialReadbackRedacted: true, rendererErrors: errors.length, ...(live ? { providerRetries: snapshot.events.filter(event => event.kind === 'provider.retry').length, usage: snapshot.runs.map(run => run.usage) } : {}) }));
+  console.log(JSON.stringify({ result: 'passed', packaged: !!process.env.KNOTRAIL_ELECTRON_EXECUTABLE, model: live ? modelId : 'scripted loopback provider through real pi SDK', authSource: live ? 'codex-login' : 'api-key', planningBeforeExecution: true, verifiedChecks: snapshot.checks.length, rightPlanningPanel: true, planTracker: true, languages: ['en', 'zh-CN'], isolatedWorktree: true, encryptedCredentialStorage: true, credentialReadbackRedacted: true, rendererErrors: errors.length, ...(live ? { providerRetries: snapshot.events.filter(event => event.kind === 'provider.retry').length, usage: snapshot.runs.map(run => run.usage) } : { acceptanceRevision: true, revisedProtectionEnforced: true }) }));
 } catch (error) {
   console.error(JSON.stringify({ lastStatus: snapshot?.task.status, lastError: snapshot?.task.error, lastEvents: snapshot?.events.slice(-5).map(event => ({ kind: event.kind, text: event.text })), providerRequests: requests.length, hostOutput: live ? undefined : hostOutput, rendererErrors: errors }));
   throw error;

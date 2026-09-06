@@ -5,12 +5,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createAppService, type AppService } from '../src/core/service.js';
-import { validatePlan } from '../src/core/validation.js';
+import { parseCommand, validatePlan } from '../src/core/validation.js';
 import { Store, id, now } from '../src/core/store.js';
 import type { Runner, RunnerRequest, RunnerCallbacks } from '../src/runtime/contracts.js';
 import type { Executor } from '../src/execution/contracts.js';
 import { CODEX_BASE_URL } from '../src/shared/contracts.js';
-import type { Project, TaskSnapshot, ImpactPreview } from '../src/shared/contracts.js';
+import type { CheckSpec, Project, TaskSnapshot, ImpactPreview } from '../src/shared/contracts.js';
 const draft={sequence:1,summary:'Update the sample and verify it',observations:[{kind:'fact' as const,text:'Sample repository'}],nodes:[{id:'edit',title:'Edit sample',goal:'Update value',dependsOn:[],kind:'edit' as const,inputs:['sample.txt'],outputs:['sample.txt'],checkIds:['check']},{id:'verify',title:'Review result',goal:'Review current files',dependsOn:['edit'],kind:'verify' as const,inputs:['sample.txt'],outputs:['report'],checkIds:['check']}]};
 class FixtureRunner implements Runner {
  count=0;pause?:{entered:()=>void;released:Promise<void>};
@@ -106,7 +106,7 @@ test('unknown effects freeze resume and every impact path until a bound recovery
  const {app,project}=await setup(t);const created=await app.command(create(project)) as TaskSnapshot;await until(app,created.task.id,s=>s.task.status==='ready');
  const preview=await app.command({type:'task.previewRetry',taskId:created.task.id,nodeId:'edit',expectedRevision:1}) as ImpactPreview;uncertainAction(app,created.task.id);
  await assert.rejects(app.command({type:'task.applyImpact',requestId:id(),preview}),/unknown effects/i);
- for(const command of [{type:'task.previewRetry',nodeId:'edit'},{type:'task.previewRevision',objective:'New objective'}])await assert.rejects(app.command({...command,taskId:created.task.id,expectedRevision:1}),/unknown effects/i);
+ for(const command of [{type:'task.previewRetry',nodeId:'edit'},{type:'task.previewRevision',objective:'New objective'},{type:'task.previewRevision',checks:[]}])await assert.rejects(app.command({...command,taskId:created.task.id,expectedRevision:1}),/unknown effects/i);
  const waiting=await app.command({type:'task.snapshot',taskId:created.task.id}) as TaskSnapshot;assert.equal(waiting.task.status,'waiting_user');assert.equal(waiting.runs.length,1);assert.equal(readFileSync(join(waiting.task.workdir,'sample.txt'),'utf8'),'original\n');
  const decision=waiting.decisions.find(d=>d.kind==='recovery')!;assert.ok(decision);assert.ok(waiting.artifacts.some(a=>a.id===decision.recovery?.artifactId));
  writeFileSync(join(waiting.task.workdir,'sample.txt'),'user kept this\n');await assert.rejects(app.command({type:'decision.answer',requestId:id(),taskId:created.task.id,decisionId:decision.id,answer:'preserve-and-replan',expectedRevision:1}),/changed/);
@@ -311,4 +311,142 @@ test('the Codex access-token expiry bounds an active Run without refreshing the 
  const fixture=new FixtureRunner();const runner:Runner={async run(r,c,signal){if(r.purpose==='planning')return fixture.run(r,c,signal);await new Promise<void>(resolve=>{if(signal.aborted)resolve();else signal.addEventListener('abort',()=>resolve(),{once:true});});return {summary:'aborted at expiry',turns:1,aborted:true};}};
  const {app,project,dataDir}=await setup(t,runner),cache=join(dataDir,'short-login.json');loginCache(cache,loginToken('short',Math.floor(Date.now()/1000)+2));const before=readFileSync(cache,'utf8');(app as any).options.codexAuthPath=cache;await app.command({type:'settings.save',patch:{model:{authSource:'codex-login',modelId:'gpt-6-astra'}}});
  const created=await app.command(create(project,{executionPolicy:'autoWithinGrant',maxRunMs:10000})) as TaskSnapshot;const stopped=await until(app,created.task.id,s=>s.task.status==='blocked');assert.match(stopped.task.error!,/Codex login has expired/);assert.equal(stopped.task.acceptedDigest,undefined);assert.equal(stopped.actions.length,0);assert.equal(readFileSync(cache,'utf8'),before);
+});
+
+test('acceptance revisions preserve old evidence, bind new checks to a new plan, and survive restart', async t => {
+ const requests: RunnerRequest[] = [];
+ let previousCallbacks: RunnerCallbacks | undefined;
+ const runner: Runner = { async run(request, callbacks, signal) {
+  requests.push(request);
+  if (request.purpose === 'planning') {
+   const plan = structuredClone(draft);
+   plan.nodes.forEach(node => node.checkIds = request.checks.map(check => check.id));
+   if (request.checks[0]?.label === 'Revised acceptance') {
+    await assert.rejects(callbacks.onControl({ kind: 'update_plan', draft: { ...plan, nodes: plan.nodes.map(node => ({ ...node, checkIds: [] })) }, submit: true }), /every user-defined check/);
+   }
+   await callbacks.onControl({ kind: 'update_plan', draft: plan, submit: true });
+  } else if (request.node?.id === 'verify' && request.checks[0]?.label === 'Sample check') {
+   previousCallbacks = callbacks;
+   await callbacks.onControl({ kind: 'decision', question: 'Review the first result?', options: ['continue', 'revise'] });
+  } else {
+   if (request.node?.id === 'edit') await callbacks.onTool({ toolCallId: id(), name: 'write_file', args: { path: 'sample.txt', content: 'updated\n' } });
+   await callbacks.onControl({ kind: 'complete', summary: 'Verified with the active definitions' });
+  }
+  return { summary: 'revision fixture', turns: 1, aborted: signal.aborted };
+ } };
+ const { app, project, dataDir } = await setup(t, runner);
+ const created = await app.command(create(project, { executionPolicy: 'autoWithinGrant' })) as TaskSnapshot;
+ const before = await until(app, created.task.id, state => state.task.status === 'waiting_user');
+ assert.equal(before.checks.length, 1);
+ assert.equal(before.checks[0]!.result, 'pass');
+ const revised: CheckSpec[] = [{ id: 'check', label: 'Revised acceptance', command: ['node', 'strict-check.mjs'], protectedPaths: ['strict-check.mjs'] }];
+ const preview = await app.command({ type: 'task.previewRevision', taskId: created.task.id, expectedRevision: 1, checks: revised }) as ImpactPreview;
+ const paused = await app.command({ type: 'task.snapshot', taskId: created.task.id }) as TaskSnapshot;
+ assert.equal(paused.task.status, 'paused');
+ assert.deepEqual(paused.task.checks, before.task.checks);
+ assert.equal(paused.task.revision, 1);
+ assert.deepEqual(preview.affected, ['edit', 'verify']);
+ assert.deepEqual(preview.retained, []);
+ assert.deepEqual(preview.checks, revised);
+ await assert.rejects(app.command({ type: 'task.applyImpact', requestId: id(), preview: { ...preview, checks: [] } }), /not issued/);
+ const executed: string[][] = [];
+ (app as any).executor = { async execute(call: any, options: any) {
+  assert.deepEqual(options.protectedPaths, ['strict-check.mjs']);
+  if (call.name === 'run_command') { assert.deepEqual(call.args.argv, ['node', 'strict-check.mjs']); executed.push(call.args.argv); return { text: 'strict condition passed', isError: false, exitCode: 0 }; }
+  assert.equal(call.name, 'write_file');
+  writeFileSync(join(options.workdir, String(call.args.path)), String(call.args.content));
+  return { text: 'updated' };
+ } };
+ const command = { type: 'task.applyImpact', requestId: id(), preview };
+ await app.command(command);
+ const after = await until(app, created.task.id, state => state.task.status === 'completed');
+ assert.equal(after.task.revision, 2);
+ assert.equal(after.task.objective, before.task.objective);
+ assert.deepEqual(after.task.checks, revised);
+ assert.deepEqual(after.task.revisionHistory.map(revision => revision.checks), [before.task.checks, revised]);
+ assert.deepEqual(after.checks.filter(check => check.taskRevision === 1), before.checks);
+ assert.deepEqual(after.plans[0], before.plan);
+ assert.equal(after.plan!.taskRevision, 2);
+ assert.equal(executed.length, 3);
+ assert.ok(after.checks.filter(check => check.taskRevision === 2).every(check => check.checksDigest !== before.checks[0]!.checksDigest && check.planId === after.task.activePlanId));
+ assert.equal(after.decisions.find(decision => decision.id === before.decisions[0]!.id)!.answer, 'invalidated');
+ assert.equal(requests.filter(request => request.purpose === 'planning').length, 2);
+ assert.deepEqual(requests.at(-1)!.checks, revised);
+ assert.deepEqual(after.events.find(event => event.kind === 'impact.applied')!.data, JSON.parse(JSON.stringify(preview)));
+ assert.equal((await previousCallbacks!.onTool({ toolCallId: id(), name: 'write_file', args: { path: 'sample.txt', content: 'late write' } })).isError, true);
+ assert.equal(readFileSync(join(after.task.workdir, 'sample.txt'), 'utf8'), 'updated\n');
+ assert.equal((await app.command(command) as TaskSnapshot).task.revision, 2);
+ await assert.rejects(app.command({ ...command, requestId: id() }), /changed|not issued/);
+ const report = app.report(created.task.id);
+ assert.match(report, /## Task revisions/);
+ assert.match(report, /Sample check/);
+ assert.match(report, /strict-check\.mjs/);
+ await app.shutdown();
+ const reopened = new Store(dataDir);
+ try { assert.deepEqual(reopened.get(created.task.id).task.revisionHistory, after.task.revisionHistory); } finally { reopened.close(); }
+});
+
+test('acceptance removal is explicit, maintenance keeps a check, and revised manual acceptance cannot reuse old decisions', async t => {
+ const { app, project } = await setup(t);
+ const created = await app.command(create(project)) as TaskSnapshot;
+ await until(app, created.task.id, state => state.task.status === 'ready');
+ const original = created.task.checks;
+ const objectiveOnly = await app.command({ type: 'task.previewRevision', taskId: created.task.id, expectedRevision: 1, objective: 'Keep the checks while revising the objective' }) as ImpactPreview;
+ assert.equal(objectiveOnly.checks, undefined);
+ await app.command({ type: 'task.applyImpact', requestId: id(), preview: objectiveOnly });
+ const second = await until(app, created.task.id, state => state.task.status === 'ready' && state.task.revision === 2);
+ assert.deepEqual(second.task.checks, original);
+ const removed = await app.command({ type: 'task.previewRevision', taskId: created.task.id, expectedRevision: 2, checks: [] }) as ImpactPreview;
+ await app.command({ type: 'task.applyImpact', requestId: id(), preview: removed });
+ await until(app, created.task.id, state => state.task.status === 'ready' && state.task.revision === 3);
+ await app.command({ type: 'task.resume', taskId: created.task.id, expectedRevision: 3 });
+ const waiting = await until(app, created.task.id, state => state.task.status === 'waiting_user');
+ assert.equal(waiting.task.checks.length, 0);
+ const decision = waiting.decisions.find(item => item.kind === 'acceptance' && !item.answer)!;
+ assert.equal(decision.taskRevision, 3);
+ const reinstated = await app.command({ type: 'task.previewRevision', taskId: created.task.id, expectedRevision: 3, checks: original }) as ImpactPreview;
+ await app.command({ type: 'task.applyImpact', requestId: id(), preview: reinstated });
+ const fourth = await until(app, created.task.id, state => state.task.status === 'ready' && state.task.revision === 4);
+ assert.equal(fourth.task.acceptedDigest, undefined);
+ assert.equal(fourth.decisions.find(item => item.id === decision.id)!.answer, 'invalidated');
+ await assert.rejects(app.command({ type: 'decision.answer', requestId: id(), taskId: created.task.id, expectedRevision: 4, decisionId: decision.id, answer: 'accept' }), /not waiting|missing/);
+ const maintenance = await app.command(create(project, { mode: 'maintain', intervalMinutes: 1 })) as TaskSnapshot;
+ await until(app, maintenance.task.id, state => state.task.status === 'ready');
+ await assert.rejects(app.command({ type: 'task.previewRevision', taskId: maintenance.task.id, expectedRevision: 1, checks: [] }), /at least one/);
+ assert.deepEqual((await app.command({ type: 'task.snapshot', taskId: maintenance.task.id }) as TaskSnapshot).task.checks, original);
+});
+
+test('acceptance changes reject stale sources and commit definitions, revisions and request identity atomically', async t => {
+ const { app, project } = await setup(t);
+ const created = await app.command(create(project)) as TaskSnapshot;
+ const before = await until(app, created.task.id, state => state.task.status === 'ready');
+ const revised = [{ ...created.task.checks[0]!, label: 'Updated fixed condition' }];
+ const preview = await app.command({ type: 'task.previewRevision', taskId: created.task.id, expectedRevision: 1, checks: revised }) as ImpactPreview;
+ writeFileSync(join(before.task.workdir, 'sample.txt'), 'user changed this after preview\n');
+ await assert.rejects(app.command({ type: 'task.applyImpact', requestId: id(), preview }), /workspace changed/);
+ const current = await app.command({ type: 'task.previewRevision', taskId: created.task.id, expectedRevision: 1, objective: 'Both fields change together', checks: revised }) as ImpactPreview;
+ const request = { type: 'task.applyImpact', requestId: 'acceptance-revision-atomic', preview: current };
+ // Fail the last write after task and preview updates, inside the actual SQLite transaction.
+ app.store.db.exec("CREATE TEMP TRIGGER reject_revision BEFORE INSERT ON requests WHEN NEW.id = 'acceptance-revision-atomic' BEGIN SELECT RAISE(ABORT, 'injected revision commit failure'); END");
+ await assert.rejects(app.command(request), /injected revision commit failure/);
+ const unchanged = await app.command({ type: 'task.snapshot', taskId: created.task.id }) as TaskSnapshot;
+ assert.equal(unchanged.task.revision, 1);
+ assert.deepEqual(unchanged.task.revisionHistory, before.task.revisionHistory);
+ assert.deepEqual(unchanged.task.checks, before.task.checks);
+ assert.deepEqual(app.store.value('preview:' + current.id), JSON.parse(JSON.stringify(current)));
+ app.store.db.exec('DROP TRIGGER reject_revision');
+ await app.command(request);
+ const revisedTask = await until(app, created.task.id, state => state.task.status === 'ready' && state.task.revision === 2);
+ assert.equal(revisedTask.task.objective, 'Both fields change together');
+ assert.deepEqual(revisedTask.task.checks, revised);
+ assert.equal(readFileSync(join(revisedTask.task.workdir, 'sample.txt'), 'utf8'), 'user changed this after preview\n');
+ assert.equal(app.store.value('preview:' + current.id), null);
+});
+
+test('acceptance revision input rejects absent changes, duplicate IDs, unsafe paths and untyped commands', () => {
+ const command = { type: 'task.previewRevision', taskId: 'task', expectedRevision: 1 };
+ const check = { id: 'check', label: 'Fixed condition', command: ['node', 'check.mjs'], protectedPaths: ['check.mjs'] };
+ assert.throws(() => parseCommand(command));
+ for (const checks of [[check, check], [{ ...check, command: 'node check.mjs' }], [{ ...check, protectedPaths: ['../outside'] }], [{ ...check, command: [42] }], [{ ...check, injected: true }]]) assert.throws(() => parseCommand({ ...command, checks }));
+ assert.deepEqual(parseCommand({ ...command, checks: [] }), { ...command, checks: [] });
 });

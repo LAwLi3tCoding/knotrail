@@ -28,7 +28,7 @@ export interface Artifact { id: string; taskId: string; runId: string; nodeId?: 
 export interface ActionReceipt { inputDigest?: string; resolution?: { decisionId: string; artifactId: string; taskRevision: number; workspaceDigest: string; disposition: 'preserve-and-replan' | 'preserve-and-stop'; resolvedAt: string }; id: string; taskId: string; runId: string; nodeId?: string; toolCallId: string; name: string; argsDigest: string; status: 'pending' | 'succeeded' | 'failed' | 'unknown'; output?: string; startedAt: string; endedAt?: string }
 export interface CheckReceipt { observationDigest?: string; batchId?: string; scope?: 'node' | 'final' | 'maintenance'; taskRevision?: number; planId?: string; checksDigest?: string; id: string; taskId: string; runId: string; nodeId?: string; conditionId: string; result: 'pass' | 'fail' | 'unknown'; inputDigest: string; output: string; checkedAt: string }
 export interface Decision { kind?: 'model' | 'acceptance' | 'recovery'; recovery?: { terminalStatus?: 'cancelled' | 'expired' | 'completed'; actionIds: string[]; actionsDigest: string; workspaceDigest: string; artifactId: string }; id: string; taskId: string; taskRevision: number; planId?: string; nodeId?: string; question: string; options: string[]; answer?: string; createdAt: string }
-export interface ImpactPreview { id: string; taskId: string; expectedRevision: number; expectedPlanId?: string; workspaceDigest: string; objective?: string; nodeId?: string; affected: string[]; retained: string[]; reason: string }
+export interface ImpactPreview { id: string; taskId: string; expectedRevision: number; expectedPlanId?: string; workspaceDigest: string; objective?: string; checks?: CheckSpec[]; nodeId?: string; affected: string[]; retained: string[]; reason: string }
 export interface TaskSnapshot { task: Task; plan?: PlanRevision; plans: PlanRevision[]; draft?: PlanDraft; nodes: NodeState[]; runs: Run[]; events: TaskEvent[]; artifacts: Artifact[]; actions: ActionReceipt[]; checks: CheckReceipt[]; decisions: Decision[]; lastSequence: number }
 export interface ModelConfig { authSource?: 'api-key' | 'codex-login'; expiresAt?: number; baseUrl: string; modelId: string; apiKey?: string; thinking: 'off' | 'low' | 'medium' | 'high'; contextWindow: number; maxTokens: number }
 export interface AppSettings { locale: Locale; model: Omit<ModelConfig, 'apiKey' | 'expiresAt'> & { hasApiKey: boolean }; planningOpen: boolean; responseLanguage: 'task' | 'zh-CN' | 'en'; allowNetwork: boolean }
@@ -40,7 +40,7 @@ export type AppCommand =
  | { type: 'task.create'; requestId: string; projectId: string; objective: string; checks: CheckSpec[]; executionPolicy: Task['executionPolicy']; mode: TaskMode; intervalMinutes?: number; maxTurns?: number; maxRunMs?: number; expiresAt?: string }
  | { type: 'task.snapshot' | 'task.inspectEffects'; taskId: string }
  | { type: 'task.pause' | 'task.resume' | 'task.cancel'; taskId: string; expectedRevision: number }
- | { type: 'task.previewRevision'; taskId: string; objective: string; expectedRevision: number }
+ | { type: 'task.previewRevision'; taskId: string; objective?: string; checks?: CheckSpec[]; expectedRevision: number }
  | { type: 'task.previewRetry'; taskId: string; nodeId: string; expectedRevision: number }
  | { type: 'task.applyImpact'; requestId: string; preview: ImpactPreview }
  | { type: 'decision.answer'; requestId: string; taskId: string; decisionId: string; answer: string; expectedRevision: number }

@@ -7,7 +7,7 @@
 | 验证 | 结果 | 证明范围 |
 | --- | --- | --- |
 | TypeScript 全仓检查 | 通过 | Main、Renderer、Core、Runner、工具与测试契约 |
-| `npm run check` | 31 项：30 通过、0 失败、1 条反向能力分支跳过；构建通过 | Core、真实 pi SDK、操作系统执行器、Git broker |
+| `npm run check` | 33 项：32 通过、0 失败、1 条反向能力分支跳过；构建通过 | Core、真实 pi SDK、操作系统执行器、Git broker |
 | 受限环境的沙箱不可用分支 | 单独验证通过 | 不支持或嵌套限制时 fail closed |
 | React UI 回归 | 4 组通过 | 布局、双语、偏好、决定、影响预览、表单与文件范围；使用模拟 IPC |
 | 开发态 Electron smoke | 通过 | 真 preload → Core → pi SDK → sandbox → 文件修改 → 固定检查 |

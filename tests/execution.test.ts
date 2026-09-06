@@ -60,10 +60,16 @@ test('OS sandbox denies network and truncated output is bounded', { skip: !capab
 });
 test('cancellation kills command descendants before execute resolves', { skip: !capability.sandbox }, async t => {
   const f = await fixture(t); const controller = new AbortController();
+  const originalKill = process.kill.bind(process); let groupSignals = 0;
+  t.mock.method(process, 'kill', (pid: number, signal?: NodeJS.Signals | number) => {
+    if (pid < 0 && signal === 'SIGKILL' && ++groupSignals > 1) throw Object.assign(new Error('Process group already signalled'), { code: 'EPERM' });
+    return originalKill(pid, signal);
+  });
   const command = `require('child_process').spawn(process.execPath,['-e',"setInterval(()=>require('fs').appendFileSync('ticks.txt','x'),15)"],{stdio:'inherit'});setInterval(()=>{},1000)`;
   const run = f.run('run_command', { argv: [process.execPath, '-e', command] }, controller.signal);
   for (let i = 0; i < 200; i++) { try { if ((await readFile(join(f.workdir, 'ticks.txt'))).length) break; } catch {} await delay(20); }
   controller.abort(); assert.equal((await run).isError, true);
+  assert.equal(groupSignals, 1, 'Cancellation and close must not signal the same process group twice');
   const before = await readFile(join(f.workdir, 'ticks.txt'), 'utf8'); await delay(150);
   assert.equal(await readFile(join(f.workdir, 'ticks.txt'), 'utf8'), before);
 });
@@ -126,4 +132,53 @@ test('network grant enables system DNS while the default grant cannot resolve ex
   const denied = await f.run('run_command', { argv }); assert.equal(denied.isError, true); assert.match(denied.text, /\"resolved\":false/);
   f.options.allowNetwork = true;
   const granted = await f.run('run_command', { argv }); assert.equal(granted.isError, false, granted.text); assert.match(granted.text, /\"resolved\":true/);
+});
+
+test('the first process-group EPERM remains pending until the helper closes, then rejects', { skip: !capability.sandbox }, async t => {
+  const f = await fixture(t); const controller = new AbortController();
+  const originalKill = process.kill.bind(process);
+  const denied = Object.assign(new Error('Termination denied'), { code: 'EPERM' });
+  let group: number | undefined, attempts = 0, settled = false;
+  const mocked = t.mock.method(process, 'kill', (pid: number, signal?: NodeJS.Signals | number) => {
+    if (pid < 0 && signal === 'SIGKILL') { group = pid; if (++attempts === 1) throw denied; }
+    return originalKill(pid, signal);
+  });
+  t.after(() => { mocked.mock.restore(); if (!settled && group) { try { originalKill(group, 'SIGKILL'); } catch {} } });
+  const run = f.run('run_command', { argv: [process.execPath, '-e', "setTimeout(()=>{},300)"] }, controller.signal);
+  void run.then(() => { settled = true; }, () => { settled = true; });
+  const rejection = assert.rejects(run, error => error === denied);
+  controller.abort(); await delay(50);
+  assert.equal(settled, false, 'A failed signal must not release the pending execution');
+  assert.equal(attempts, 1);
+  await rejection;
+  assert.equal(attempts, 2, 'The finite command result must trigger a successful cleanup attempt');
+  f.lock.release(); const replacement = acquireOwnerLock(f.dataDir); replacement.release();
+});
+
+
+test('close-entry EPERM keeps execution pending while a same-group background descendant writes', { skip: !capability.sandbox }, async t => {
+  const f = await fixture(t); f.options.timeoutMs = 1000;
+  const originalKill = process.kill.bind(process);
+  const denied = Object.assign(new Error('First close termination denied'), { code: 'EPERM' });
+  let group: number | undefined, attempts = 0, submitted = false, settled = false;
+  let onFirstAttempt!: () => void;
+  const firstAttempt = new Promise<void>(resolve => { onFirstAttempt = resolve; });
+  const mocked = t.mock.method(process, 'kill', (pid: number, signal?: NodeJS.Signals | number) => {
+    if (pid < 0 && signal === 'SIGKILL') { group = pid; if (++attempts === 1) { onFirstAttempt(); throw denied; } }
+    const value = originalKill(pid, signal); if (pid === group) submitted = true; return value;
+  });
+  t.after(() => { mocked.mock.restore(); if (!submitted && group) { try { originalKill(group, 'SIGKILL'); } catch {} } });
+  const command = `require('child_process').spawn(process.execPath,['-e',"const timer=setInterval(()=>require('fs').appendFileSync('background.txt','x'),10);setTimeout(()=>clearInterval(timer),2000)"],{stdio:'ignore'}).unref();setTimeout(()=>{process.kill(process.ppid,'SIGKILL');process.exit(0)},150)`;
+  const run = f.run('run_command', { argv: [process.execPath, '-e', command] });
+  void run.then(() => { settled = true; }, () => { settled = true; });
+  const rejection = assert.rejects(run, error => error === denied);
+  await firstAttempt;
+  const before = await readFile(join(f.workdir, 'background.txt'), 'utf8'); await delay(50);
+  assert.ok((await readFile(join(f.workdir, 'background.txt'), 'utf8')).length > before.length);
+  assert.equal(settled, false, 'Helper close must not release execution while group termination failed');
+  await rejection;
+  assert.equal(attempts, 2, 'The deadline must retry cleanup after the close-entry failure');
+  assert.equal(submitted, true);
+  const stopped = await readFile(join(f.workdir, 'background.txt'), 'utf8'); await delay(100);
+  assert.equal(await readFile(join(f.workdir, 'background.txt'), 'utf8'), stopped);
 });

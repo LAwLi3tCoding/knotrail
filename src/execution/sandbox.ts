@@ -45,23 +45,40 @@ export class SandboxExecutor implements Executor {
       stdio: ['pipe', 'pipe', 'pipe', 'ignore', options.lockFd],
     });
     let result: ExecutionResult | undefined, stderr = '', cancelled = false, settled = false;
-    const killGroup = () => { if (child.pid) { try { process.kill(-child.pid, 'SIGKILL'); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; } } };
-    const abort = () => { cancelled = true; killGroup(); };
-    const timer = setTimeout(abort, options.timeoutMs);
-    signal.addEventListener('abort', abort, { once: true });
-    child.stderr?.on('data', chunk => { stderr = (stderr + chunk.toString()).slice(-8_000); });
-    let protocol = '';
-    child.stdout?.on('data', chunk => { protocol += chunk.toString(); const end = protocol.indexOf('\n'); if (end >= 0) { try { result = JSON.parse(protocol.slice(0, end)) as ExecutionResult; } catch { result = { text: 'Invalid sandbox helper response', isError: true }; } killGroup(); } });
-    child.stdin?.on('error', () => {});
-    child.stdin?.write(JSON.stringify({ call, workdir, temp, protectedPaths: options.protectedPaths, timeoutMs: options.timeoutMs }) + '\n');
     return new Promise((resolveResult, reject) => {
-      const finish = () => { clearTimeout(timer); signal.removeEventListener('abort', abort); rmSync(temp, { recursive: true, force: true }); settled = true; };
-      child.once('error', error => { if (!settled) { finish(); reject(error); } });
+      let terminationSubmitted = false, childClosed = false;
+      let terminationError: unknown;
+      let closeCode: number | null = null, closeSignal: NodeJS.Signals | null = null;
+      const maybeFinish = () => {
+        if (settled || !childClosed || !terminationSubmitted) return;
+        clearTimeout(timer); signal.removeEventListener('abort', abort); rmSync(temp, { recursive: true, force: true }); settled = true;
+        if (terminationError) { reject(terminationError); return; }
+        resolveResult(cancelled ? { text: 'Execution cancelled or timed out', isError: true } : result || { text: stderr || `Sandbox helper exited without a result (${closeCode ?? closeSignal})`, isError: true });
+      };
+      const killGroup = () => {
+        if (!child.pid) terminationSubmitted = true;
+        else if (!terminationSubmitted) {
+          try { process.kill(-child.pid, 'SIGKILL'); terminationSubmitted = true; }
+          catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ESRCH') terminationSubmitted = true;
+            else { terminationError ??= error; }
+          }
+        }
+        maybeFinish();
+      };
+      const abort = () => { cancelled = true; killGroup(); };
+      const timer = setTimeout(abort, options.timeoutMs);
+      signal.addEventListener('abort', abort, { once: true });
+      child.stderr?.on('data', chunk => { stderr = (stderr + chunk.toString()).slice(-8_000); });
+      let protocol = '';
+      child.stdout?.on('data', chunk => { protocol += chunk.toString(); const end = protocol.indexOf('\n'); if (end >= 0) { try { result = JSON.parse(protocol.slice(0, end)) as ExecutionResult; } catch { result = { text: 'Invalid sandbox helper response', isError: true }; } killGroup(); } });
+      child.stdin?.on('error', () => {});
+      child.stdin?.write(JSON.stringify({ call, workdir, temp, protectedPaths: options.protectedPaths, timeoutMs: options.timeoutMs }) + '\n');
+      child.once('error', error => { terminationError ??= error; killGroup(); });
       child.once('close', (code, exitSignal) => {
-        if (settled) return;
-        // Closing stdout/stderr proves inherited pipes closed; group kill also removes background descendants.
-        killGroup(); finish();
-        resolveResult(cancelled ? { text: 'Execution cancelled or timed out', isError: true } : result || { text: stderr || `Sandbox helper exited without a result (${code ?? exitSignal})`, isError: true });
+        childClosed = true; closeCode = code; closeSignal = exitSignal;
+        // Closed helper pipes alone do not prove that same-group background descendants stopped.
+        killGroup();
       });
     });
   }

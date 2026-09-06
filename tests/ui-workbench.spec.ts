@@ -281,3 +281,114 @@ test('acceptance copy is translated without translating model-authored choices',
   await expect(page.getByText('Model-authored question?', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: 'accept', exact: true })).toBeVisible();
 });
+
+test('external wait observations stay visible with planning closed and preserve source values across languages', async ({ page }) => {
+  await start(page);
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, mode: 'finite', status: 'waiting_external', nextCheckAt: '2026-09-06T09:15:00Z', wait: { id: 'wait-1', taskRevision: 1, planId: 'plan-1', runId: 'run-2', nodeId: 'edit', registeredAt: '2026-09-06T09:00:00Z', reason: 'Wait for release readiness.', minutes: 5, source: { kind: 'project_file', path: 'status/release.txt' }, condition: { kind: 'contains', text: 'READY=v2' }, last: { checkedAt: '2026-09-06T09:10:00Z', status: 'unknown', error: 'Source temporarily unavailable', missedIntervals: 2, gapSince: '2026-09-06T09:00:00Z' } } }, runs: state.snapshot.runs.map(run => ({ ...run, status: 'succeeded' })) });
+  });
+  const observation = page.locator('.conversation').getByRole('region', { name: 'External wait', exact: true });
+  await expect(page.getByRole('complementary', { name: 'Planning', exact: true })).toHaveCount(0);
+  await expect(observation).toContainText('Project file');
+  await expect(observation).toContainText('status/release.txt');
+  await expect(observation).toContainText('READY=v2');
+  await expect(observation).toContainText('Unknown');
+  await expect(observation).toContainText('Source temporarily unavailable');
+  await expect(observation).toContainText('Repeated source information does not start another model run.');
+  await expect(observation.getByText('Consumed at', { exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Pause', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Pause', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Resume', exact: true })).toBeVisible();
+  await expect(observation.locator('time[datetime="2026-09-06T09:10:00Z"]')).toHaveCount(1);
+  await expect(observation.locator('time[datetime="2026-09-06T09:15:00Z"]')).toHaveCount(1);
+  await expect(observation.getByText('Observation gap since', { exact: true })).toBeVisible();
+  await page.getByRole('textbox', { name: 'Describe a requirement change…' }).fill('Keep READY=v2 unchanged');
+  await page.getByRole('combobox', { name: 'Language', exact: true }).selectOption('zh-CN');
+  const chinese = page.locator('.conversation').getByRole('region', { name: '外部等待', exact: true });
+  await expect(chinese).toContainText('待确认');
+  await expect(chinese).toContainText('项目文件');
+  await expect(chinese).toContainText('status/release.txt');
+  await expect(chinese).toContainText('READY=v2');
+  await expect(chinese).toContainText('漏过的周期');
+  await expect(chinese).toContainText('观测缺口起点');
+  await expect(chinese).toContainText('重复的来源信息不会再次启动模型');
+  await expect(page.getByRole('textbox', { name: '补充或修改任务要求…' })).toHaveValue('Keep READY=v2 unchanged');
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    const wait = state.snapshot.task.wait!;
+    state.change({ task: { ...state.snapshot.task, wait: { ...wait, last: { ...wait.last, status: 'waiting', content: 'RELEASE=pending', digest: 'source-digest', error: undefined } } } });
+  });
+  await expect(chinese).toContainText('条件未满足');
+  await expect(chinese.locator('pre')).toHaveText('RELEASE=pending');
+  await page.getByRole('button', { name: '定时任务', exact: true }).click();
+  const scheduled = page.locator('.schedule-list').getByRole('region', { name: '外部等待', exact: true });
+  await expect(scheduled).toContainText('status/release.txt');
+  await expect(scheduled).toContainText('READY=v2');
+  await expect(scheduled).toContainText('RELEASE=pending');
+  await expect(scheduled).toContainText('漏过的周期');
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    const wait = state.snapshot.task.wait!;
+    state.change({ task: { ...state.snapshot.task, status: 'executing', wait: { ...wait, consumedAt: '2026-09-06T09:15:01Z', last: { ...wait.last, status: 'satisfied', content: 'READY=v2' } } } });
+  });
+  await expect(scheduled).toContainText('条件已满足');
+  await expect(scheduled).toContainText('消费时间');
+  await expect(scheduled.locator('time[datetime="2026-09-06T09:15:01Z"]')).toHaveCount(1);
+  const commands = await page.evaluate(() => (window as unknown as { uiTest: { commands: AppCommand[] } }).uiTest.commands);
+  expect(commands.filter(command => command.type === 'task.pause')).toHaveLength(1);
+  expect(commands.some(command => command.type === 'task.cancel')).toBe(false);
+});
+
+test('maintenance shows observation bindings, resumes only checks, and verification does not count as model usage', async ({ page }) => {
+  await start(page);
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, mode: 'maintain', status: 'unknown', nextCheckAt: '2026-09-06T09:20:00Z', health: { status: 'unknown', checkedAt: '2026-09-06T09:10:00Z', inputDigest: 'maintenance-input', batchId: 'maintenance-batch', runId: 'verification-1', reason: 'Workspace changed during verification', missedIntervals: 3, gapSince: '2026-09-06T09:00:00Z' } }, runs: [{ ...state.snapshot.runs[1]!, status: 'succeeded' }] });
+  });
+  const observation = page.locator('.conversation').getByRole('region', { name: 'Maintenance verification', exact: true });
+  await expect(observation).toContainText('Unknown');
+  await expect(observation).toContainText('Workspace changed during verification');
+  await expect(observation).toContainText('maintenance-input');
+  await expect(observation).toContainText('maintenance-batch');
+  await expect(observation).toContainText('verification-1');
+  await expect(observation).toContainText('No automatic repair. Resume reruns checks');
+  await expect(observation.locator('time[datetime="2026-09-06T09:10:00Z"]')).toHaveCount(1);
+  await page.getByRole('button', { name: 'Pause', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Pause', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: 'Resume', exact: true }).click();
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, status: 'verifying' }, runs: [...state.snapshot.runs, { id: 'verification-2', taskId: 'task-1', taskRevision: 1, planId: 'plan-1', purpose: 'verification', attempt: 2, status: 'running', inputDigest: 'maintenance-next', startedAt: '2026-09-06T09:15:00Z' }] });
+  });
+  await expect(page.locator('.running-line')).toContainText('Maintenance verification');
+  await expect(page.locator('.running-line')).not.toContainText('Planning');
+  await page.locator('.composer-footer summary').click();
+  await expect(page.locator('.composer-footer dd').nth(1)).toHaveText('1,234');
+  await expect(page.locator('.composer-footer dd').nth(2)).toHaveText('456');
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, status: 'unhealthy', health: { ...state.snapshot.task.health!, status: 'unhealthy', reason: 'Fixed check exited 1' } }, runs: state.snapshot.runs.map(run => ({ ...run, status: 'succeeded' })) });
+  });
+  await expect(page.getByRole('button', { name: 'Resume', exact: true })).toBeVisible();
+  await page.getByRole('combobox', { name: 'Language', exact: true }).selectOption('zh-CN');
+  const chinese = page.locator('.conversation').getByRole('region', { name: '维护复验', exact: true });
+  await expect(chinese).toContainText('检查异常');
+  await expect(chinese).toContainText('Fixed check exited 1');
+  await expect(chinese).toContainText('不会自动修复');
+  await expect(chinese).toContainText('maintenance-batch');
+  await page.getByRole('button', { name: '暂停', exact: true }).click();
+  await page.evaluate(() => {
+    const state = (window as unknown as { uiTest: { snapshot: TaskSnapshot; change: (patch: Partial<TaskSnapshot>) => void } }).uiTest;
+    state.change({ task: { ...state.snapshot.task, status: 'healthy', health: { ...state.snapshot.task.health!, status: 'healthy', reason: undefined } } });
+  });
+  await expect(chinese).toContainText('检查正常');
+  await page.getByRole('button', { name: '暂停', exact: true }).click();
+  await page.getByRole('button', { name: '定时任务', exact: true }).click();
+  await expect(page.locator('.schedule-list').getByRole('region', { name: '维护复验', exact: true })).toContainText('maintenance-input');
+  const commands = await page.evaluate(() => (window as unknown as { uiTest: { commands: AppCommand[] } }).uiTest.commands);
+  expect(commands.filter(command => command.type === 'task.resume')).toHaveLength(1);
+  expect(commands.filter(command => command.type === 'task.pause')).toHaveLength(3);
+  expect(commands.some(command => command.type === 'task.cancel')).toBe(false);
+  expect(commands.some(command => command.type === 'task.applyImpact' || command.type === 'task.previewRetry')).toBe(false);
+});

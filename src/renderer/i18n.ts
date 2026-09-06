@@ -14,6 +14,13 @@ const zh = {
   'No automated checks. Completion will require your acceptance.': '未配置自动检查，完成任务需要你的验收。',
   'No checks yet': '尚无检查结果', 'No changes yet': '尚无变更产物', 'No command output yet': '尚无命令输出',
   'No scheduled tasks': '还没有定时任务', 'Create a finite or maintenance task to schedule checks while the app is running.': '创建有限持续任务或维护任务，在 App 运行期间按周期检查。',
+  'External wait': '外部等待', 'Maintenance verification': '维护复验', 'Project file': '项目文件', 'Task workspace file': '任务工作区文件',
+  'File content changes': '文件内容发生变化', 'File exists': '文件存在', 'File contains': '文件包含', 'Observed content': '观察到的内容',
+  'File missing': '文件不存在', 'Source identity': '来源标识', 'Observation digest': '观测摘要',
+  'Last observation': '上次观察', 'Next observation': '下次观察', 'Missed intervals': '漏过的周期', 'Observation gap since': '观测缺口起点',
+  'Consumed at': '消费时间', 'Repeated source information does not start another model run.': '重复的来源信息不会再次启动模型。',
+  'No observations are available for this gap. Missed intervals were not replayed.': '这段时间没有观测记录，漏过的周期未补跑。',
+  'No automatic repair. Resume reruns checks; change the requirements or retry a step to request a repair.': '不会自动修复。点击“继续”只会重新检查；如需修复，请修改要求或重做步骤。',
   'Goal': '目标', 'Inputs': '输入', 'Expected outputs': '预期产物', 'Depends on': '依赖步骤', 'None': '无',
   'Inspect step': '查看步骤', 'Retry step': '重做此步骤', 'Preview impact': '预览影响', 'Review impact': '审阅影响',
   'Affected steps': '受影响步骤', 'Retained steps': '保留步骤', 'Apply and continue': '应用并继续', 'Dismiss': '关闭',
@@ -81,6 +88,7 @@ const zh = {
   'expired': '已到期', 'completed': '已完成', 'healthy': '检查正常', 'unhealthy': '检查异常', 'queued': '待执行',
   'running': '执行中', 'verified': '已验证', 'stale': '需重新验证', 'failed': '失败', 'unknown': '待确认',
   'pending': '进行中', 'succeeded': '成功', 'aborted': '已中止', 'pass': '通过', 'fail': '未通过',
+  'waiting': '条件未满足', 'satisfied': '条件已满足',
 } as const;
 
 export type TextKey = keyof typeof zh;
@@ -93,6 +101,7 @@ const statusEn: Record<string, string> = {
   blocked: 'Blocked', paused: 'Paused', cancelled: 'Cancelled', expired: 'Expired', completed: 'Completed',
   healthy: 'Healthy', unhealthy: 'Unhealthy', running: 'Running', verified: 'Verified', stale: 'Stale',
   failed: 'Failed', unknown: 'Unknown', pending: 'Pending', succeeded: 'Succeeded', aborted: 'Aborted', pass: 'Pass', fail: 'Fail',
+  waiting: 'Condition unmet', satisfied: 'Condition met',
 };
 export function translator(locale: Locale) {
   const resolved = resolveLocale(locale);

@@ -1,4 +1,4 @@
-# Knotrail（程迹）：机会探索与产品取舍 v3.1
+# Knotrail：机会探索与产品取舍 v3.1
 
 > 交付更新（2026-09-06）：可运行的 v0.1.0 已实现。本文保留设计与研究背景，当前能力、限制和验收以 [README](README.md)、[实现架构](ARCHITECTURE.md) 与 [验证报告](docs/VALIDATION.md) 为准。
 状态：待验证机会，2026-09-05。本文取代旧版 48 个方向和主观加权评分，不再用底座能力数量代替产品价值。主方案见 [PRODUCT-BRIEF.md](PRODUCT-BRIEF.md)，竞品事实见 [COMPARISON.md](COMPARISON.md)。

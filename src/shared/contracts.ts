@@ -1,26 +1,30 @@
 export type Locale = 'system' | 'zh-CN' | 'en';
 export type TaskMode = 'once' | 'finite' | 'maintain';
-export type TaskStatus = 'planning' | 'ready' | 'executing' | 'verifying' | 'waiting_user' | 'waiting_external' | 'reconciling' | 'blocked' | 'paused' | 'cancelled' | 'expired' | 'completed' | 'healthy' | 'unhealthy';
+export type TaskStatus = 'planning' | 'ready' | 'executing' | 'verifying' | 'waiting_user' | 'waiting_external' | 'reconciling' | 'blocked' | 'paused' | 'cancelled' | 'expired' | 'completed' | 'healthy' | 'unhealthy' | 'unknown';
 export type NodeStatus = 'queued' | 'running' | 'verified' | 'stale' | 'failed' | 'unknown';
 export interface CheckSpec { id: string; label: string; command: string[]; protectedPaths: string[] }
 export interface PlanNode { id: string; title: string; goal: string; dependsOn: string[]; kind: 'research' | 'edit' | 'verify'; inputs: string[]; outputs: string[]; checkIds: string[] }
 export interface PlanDraft { sequence: number; summary: string; observations: { kind: 'fact' | 'constraint' | 'proposal'; text: string; source?: string }[]; nodes: PlanNode[] }
 export interface PlanRevision extends PlanDraft { id: string; taskRevision: number; revision: number; createdAt: string; digest: string; inputDigest?: string }
+export interface WaitRequest { reason: string; minutes: number; source: { kind: 'workspace_file' | 'project_file'; path: string }; condition: { kind: 'changed' | 'exists' } | { kind: 'contains'; text: string } }
+export interface SourceObservation { checkedAt: string; status: 'waiting' | 'satisfied' | 'unknown'; digest?: string | null; content?: string; error?: string; missedIntervals: number; gapSince?: string; sourceIdentity?: string }
+export interface WaitState extends WaitRequest { id: string; taskRevision: number; planId?: string; runId: string; nodeId?: string; registeredAt: string; consumedAt?: string; sourceIdentity?: string; baselineDigest?: string | null; last: SourceObservation }
+export interface HealthObservation { status: 'healthy' | 'unhealthy' | 'unknown'; checkedAt: string; inputDigest?: string; batchId?: string; runId?: string; reason?: string; missedIntervals: number; gapSince?: string }
 export interface TaskRevision { revision: number; objective: string; checks: CheckSpec[]; createdAt: string }
 export interface Task {
   id: string; projectId: string; title: string; objective: string; mode: TaskMode; status: TaskStatus;
   revision: number; activePlanId?: string; workdir: string; baseline: string; createdAt: string; updatedAt: string;
   executionPolicy: 'autoWithinGrant' | 'reviewBeforeExecute'; checks: CheckSpec[]; error?: string;
   maxTurns: number; maxRunMs: number; turnCount: number; intervalMinutes?: number; nextCheckAt?: string; expiresAt?: string;
-  acceptedDigest?: string; revisionHistory: TaskRevision[];
+  consumedObservations?: Record<string, string>; wait?: WaitState; health?: HealthObservation; acceptedDigest?: string; revisionHistory: TaskRevision[];
 }
 export interface Project { id: string; name: string; path: string; createdAt: string }
 export interface NodeState { nodeId: string; status: NodeStatus; attempt: number; runId?: string; inputDigest?: string; outputDigest?: string; reason?: string }
-export interface Run { id: string; taskId: string; taskRevision: number; planId?: string; nodeId?: string; purpose: 'planning' | 'node'; attempt: number; status: 'running' | 'succeeded' | 'failed' | 'aborted' | 'unknown'; startedAt: string; endedAt?: string; inputDigest: string; summary?: string; sessionPath?: string; usage?: { input: number; output: number; partial?: boolean } }
+export interface Run { id: string; taskId: string; taskRevision: number; planId?: string; nodeId?: string; purpose: 'planning' | 'node' | 'verification'; attempt: number; status: 'running' | 'succeeded' | 'failed' | 'aborted' | 'unknown'; startedAt: string; endedAt?: string; inputDigest: string; summary?: string; sessionPath?: string; usage?: { input: number; output: number; partial?: boolean } }
 export interface TaskEvent { seq: number; id: string; taskId: string; taskRevision: number; planId?: string; nodeId?: string; runId?: string; kind: string; text: string; data?: unknown; createdAt: string }
 export interface Artifact { id: string; taskId: string; runId: string; nodeId?: string; kind: 'diff' | 'text' | 'file'; name: string; digest: string; createdAt: string; content: string; truncated: boolean }
 export interface ActionReceipt { inputDigest?: string; resolution?: { decisionId: string; artifactId: string; taskRevision: number; workspaceDigest: string; disposition: 'preserve-and-replan' | 'preserve-and-stop'; resolvedAt: string }; id: string; taskId: string; runId: string; nodeId?: string; toolCallId: string; name: string; argsDigest: string; status: 'pending' | 'succeeded' | 'failed' | 'unknown'; output?: string; startedAt: string; endedAt?: string }
-export interface CheckReceipt { batchId?: string; scope?: 'node' | 'final'; taskRevision?: number; planId?: string; checksDigest?: string; id: string; taskId: string; runId: string; nodeId?: string; conditionId: string; result: 'pass' | 'fail' | 'unknown'; inputDigest: string; output: string; checkedAt: string }
+export interface CheckReceipt { observationDigest?: string; batchId?: string; scope?: 'node' | 'final' | 'maintenance'; taskRevision?: number; planId?: string; checksDigest?: string; id: string; taskId: string; runId: string; nodeId?: string; conditionId: string; result: 'pass' | 'fail' | 'unknown'; inputDigest: string; output: string; checkedAt: string }
 export interface Decision { kind?: 'model' | 'acceptance' | 'recovery'; recovery?: { terminalStatus?: 'cancelled' | 'expired' | 'completed'; actionIds: string[]; actionsDigest: string; workspaceDigest: string; artifactId: string }; id: string; taskId: string; taskRevision: number; planId?: string; nodeId?: string; question: string; options: string[]; answer?: string; createdAt: string }
 export interface ImpactPreview { id: string; taskId: string; expectedRevision: number; expectedPlanId?: string; workspaceDigest: string; objective?: string; nodeId?: string; affected: string[]; retained: string[]; reason: string }
 export interface TaskSnapshot { task: Task; plan?: PlanRevision; plans: PlanRevision[]; draft?: PlanDraft; nodes: NodeState[]; runs: Run[]; events: TaskEvent[]; artifacts: Artifact[]; actions: ActionReceipt[]; checks: CheckReceipt[]; decisions: Decision[]; lastSequence: number }

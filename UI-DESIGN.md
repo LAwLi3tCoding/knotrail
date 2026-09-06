@@ -1,4 +1,4 @@
-# Knotrail（程迹）：桌面交互方案 v3.1
+# Knotrail：桌面交互方案 v3.1
 
 > 交付更新（2026-09-06）：可运行的 v0.1.0 已实现。本文保留设计与研究背景，当前能力、限制和验收以 [README](README.md)、[实现架构](ARCHITECTURE.md) 与 [验证报告](docs/VALIDATION.md) 为准。
 状态：产品设计，2026-09-05。本次以 Codex App 为主要参照，结合 DSH 与用户本地 Catdesk 的页面布局，补齐工作视图与工具面板；规划侧栏固定在右边，App 支持简体中文和 English。本文定义拟实现的界面与行为；会话中的交互示意使用模拟数据，未连接 Agent、仓库或模型。产品范围以 [产品方案](PRODUCT-BRIEF.md) 为准，运行语义以 [架构](ARCHITECTURE.md) 为准，交付顺序见 [实施计划](IMPLEMENTATION-PLAN.md)。

@@ -33,7 +33,7 @@ export function safePath(root: string, path: string, mustExist = true): string {
   const base = realpathSync(root), target = resolve(base,path), rel = relative(base,target);
   if (!rel || rel.startsWith('../') || rel==='..' || isAbsolute(rel) || rel.split(/[\\/]/).some(p=>p==='.git')) throw new Error('Path is outside the allowed workspace');
   let cursor=base;
-  for (const part of rel.split('/')) { cursor=join(cursor,part); if (existsSync(cursor) && lstatSync(cursor).isSymbolicLink()) throw new Error('Symbolic links are not supported'); }
+  for (const part of rel.split('/')) { cursor=join(cursor,part); try { if (lstatSync(cursor).isSymbolicLink()) throw new Error('Symbolic links are not supported'); } catch(error) { if ((error as NodeJS.ErrnoException).code!=='ENOENT') throw error; } }
   if (mustExist && !existsSync(target)) throw new Error('File not found'); return target;
 }
 export function files(root: string): string[] {

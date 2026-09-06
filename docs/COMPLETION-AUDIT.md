@@ -1,8 +1,8 @@
 # 全目标完成度审查
 
-审查日期：2026-09-06。初次代码基线：`f689600`；本次更新同时读取其后的工作区差异，包括 Core、共享协议、Core 测试及正在更新的 Renderer。本文不将上一轮测试通过或 `v0.1.0` 交付声明当作全部需求完成的证明。审查者仅修改本报告；固定验收一致性、规划发布和 unknown 恢复门已有新实现，本轮修复已独立复核，其余范围仍在进行。
+审查日期：2026-09-06。初次代码基线：`f689600`；本次更新读取其后的 Core、共享协议、测试和 Renderer，并同步 README、架构、代码及用户文档。本文不将上一轮测试通过或 `v0.1.0` 交付声明当作全部需求完成的证明。此前固定验收一致性、规划发布和 unknown 恢复门修复已有独立复核；本轮 M3 文件观察、维护复验及相关修复已通过回归、独立复核和实际打包态验证；这次局部交付已验证，完整目标仍未完成。
 
-**结论：完整目标尚未完成。** 已有真实 pi SDK、Electron/React、SQLite、工具执行边界、双语工作台和公开交付所需工程文件。本轮又加入规划来源复核、统一验收批次、未知效果恢复准入与持久用户处置。选择性复用、文件效果自动查证、完整崩溃实验、带来源的托管等待、真实开发案例与同题比较仍有实现或证据缺口。缺少远端模型凭据只阻塞其中一部分验收，不阻塞下文列出的开发工作。
+**结论：完整目标尚未完成。** 已有真实 pi SDK、Electron/React、SQLite、工具执行边界、双语工作台和公开交付所需工程文件。规划来源复核、统一验收批次、未知效果恢复准入与持久用户处置之后，本轮又加入带来源/条件的本地 Wait、跨 Wait 消费记录、漏查合并，以及不重跑写节点的维护固定检查。本地路径已通过本轮局部交付验证；选择性复用、文件效果自动查证、完整崩溃实验、真实开发案例与同题比较仍有实现或证据缺口。账户认证接入与真实模型验收只是其中一部分，不能替代下文列出的开发工作。
 
 ## 1. 审查口径
 
@@ -21,16 +21,20 @@
 
 本报告没有重新执行测试、访问线上模型或核验 GitHub 远端；测试来源指向的是当前测试文件中的实际断言。完整发布仍需由交付负责人读取最终提交、当次测试结果、远端仓库可见性、远端 SHA 和 CI。已有 [验证报告](VALIDATION.md) 是历史运行记录，不替代上述当前证据。
 
-交付负责人随后读取了当前运行结果：`npm run check` 共 46 项，45 通过、1 条反向沙箱能力分支跳过，包含 Core 的 25 项；UI 的 7 项均有通过记录；刚打包的实际 Electron App 经真实 pi SDK 和回环协议服务完成沙箱改文件及两次固定检查，Renderer 错误为 0。这些证据只覆盖具体断言，不能代替真实模型、自然任务或整项 oracle。独立代码审查先发现跨任务终态复活和真实 pi 缺失用量补零，两项均先复现、再修复；原始独立复现复跑通过后，本轮改动审查 pass。
+上一轮 `npm run check` 为 46 项（45 通过、1 条反向沙箱能力分支跳过），UI 为 7 项；当时打包的实际 Electron App 经真实 pi SDK 和回环协议服务完成沙箱改文件及两次固定检查，Renderer 错误为 0。该轮独立审查发现的跨任务终态复活和真实 pi 缺失用量补零均已复现、修复并复跑通过。这些是此前代码的证据，不能直接覆盖本轮新增调度路径。
+
+M3 首轮 `npm run check` 为 55 项（54 通过、1 条预期反向沙箱能力分支跳过），其中 Core 33 项、runtime 7 项。后续独立审查复现了来源消费后撤销仍可执行、显式修改目标后无法使用已有合格来源、A → B → A → B 被终身去重拦住的三个反例；对应实现已修复，原反例回归通过，并补了 Run 中撤销与条件恢复等边界。
+
+交付负责人已读取修复后的最新 `npm run check`：60 项，59 通过、1 条预期反向沙箱能力分支跳过，其中 Core 38 项、runtime 7 项；typecheck 与 build 通过。最新 UI 9/9 通过，包含托管状态 Pause 和真实 consumedAt 展示。本报告没有自行重跑这些命令。独立审查已正式通过，open_findings=[]，三个原始反例未经修改复跑 3/3 通过，四项修复均已解决。重新打包的实际 App smoke 也已通过：packaged=true，真实 pi SDK 与回环协议服务完成两项固定检查，右侧规划、中英切换及加密安全存储正常，rendererErrors=0。本轮局部交付验证已完成。持久 Wait 的数据库边界重建不等于真实进程强杀，loopback pi 也不等于真实远端模型或自然任务验证。
 
 ## 2. M0—M4 阶段
 
 | 阶段 | 目前成立的部分 | 尚未成立的原要求 | 判定 |
 | --- | --- | --- | --- |
-| M0 桌面交互 | `src/renderer/App.tsx`：项目任务、对话/活动/变更、文件/终端/产物预览、右侧规划过程/步骤/图/列表/节点详情；`i18n.ts` 和偏好读写；UI 更新已加入 typed acceptance/recovery 双语、恢复证据、历史检查与缺失用量展示 | 没有真实用户完成三个交互问题的记录；没有同宽 Codex/DSH/用户指定界面视觉对照验收；原测试最窄为 390 px，原要求 360 px；宿主错误与影响说明仍需双语覆盖；真实重载/断连、移除选中节点说明缺证据；UI 新改动仍需回归 | 部分 |
-| M1 真实规划到执行 | `pi-worker.ts` 显式 SDK 与资源白名单；`service.ts` 只读规划、Ready、节点 Run；候选在 Runner 收尾后核对 taskRevision/旧 planId/工作区 inputDigest 再发布；Ready 后首次执行前变化会重新规划；已有真实 Electron 单文件 smoke 与 OS 边界测试 | 真实依赖升级未运行；逐来源输入、实际产物和授权条件未进入完整校验；新发布路径仍需独立复核及真实进程终止实验；detached/setsid 后代清理仍不满足完整收尾边界 | 部分；真实模型验收有外部依赖 |
-| M2 节点证据与改计划 | 真实动作、Run、artifact、check、计划版本、一次性影响预览；目标修订保留旧 Plan；新增 CheckBatch 统一绑定 taskRevision/planId/checksDigest/inputDigest，并在节点落盘及最终提交复核 | 改目标一律丢弃所有节点完成资格，无合格独立分析复用；缺实际产物消费引用和逐来源输入身份；不能在任务中修改固定验收；两个真实开发题及中途改约束未运行；T12/T18 修复和故障回归已有，尚需独立审查 | 部分，待复核 |
-| M3 局部继续与托管 | 停止后在现有 worktree 创建新 Run；新增 `unresolved/requireRecovery`、共享 `executeRecorded`、绑定工作区和未知动作集合的 typed recovery Decision；普通恢复/影响应用/drive/finalize 受门控制；未知命令阻止其他 Task 的执行；用户处置留原 unknown 历史 | 无文件前后状态 witness 和自动后置状态查证；真实强杀/完整收尾实验仍不足；等待只看时间、不刷新登记来源；观测缺口和无变化停止模型重试未实现；维护变化可能重做写节点，失败未落 unhealthy；局部复用无输入证据 | 部分，恢复门已有 |
+| M0 桌面交互 | `src/renderer/App.tsx`：项目任务、对话/活动/变更、文件/终端/产物预览、右侧规划过程/步骤/图/列表/节点详情；typed acceptance/recovery 双语、恢复证据、历史检查与缺失用量；三处共用观察卡片、真实消费时间与托管 Pause，最新 UI 9/9 通过 | 用户新增的整体计划/todo/工具调用/决定逐步展示强化尚未完成；没有真实用户完成三个交互问题的记录；没有同宽 Codex/DSH/用户指定界面视觉对照；原要求 360 px、宿主错误双语、真实重载/断连和移除节点说明仍缺完整证据 | 部分 |
+| M1 真实规划到执行 | `pi-worker.ts` 显式 SDK 与资源白名单；`service.ts` 只读规划、Ready、节点 Run；候选在 Runner 收尾后核对 taskRevision/旧 planId/工作区 inputDigest 再发布；Ready 后首次执行前变化会重新规划；该发布门已有独立复核，另有真实 Electron 单文件 smoke 与 OS 边界测试 | 真实依赖升级未运行；逐来源输入、实际产物和授权条件未进入完整校验；实际提交后强杀实验仍缺；detached/setsid 后代清理仍不满足完整收尾边界 | 部分；真实模型验收有外部依赖 |
+| M2 节点证据与改计划 | 真实动作、Run、artifact、check、计划版本、一次性影响预览；目标修订保留旧 Plan；CheckBatch 绑定 taskRevision/planId/checksDigest/inputDigest，节点及最终提交复核；本轮增加等待观察摘要 | 改目标一律丢弃所有节点完成资格，无合格独立分析复用；缺实际产物消费引用和逐来源输入身份；不能在任务中修改固定验收；两个真实开发题及中途改约束未运行；T12/T18 原修复及本轮观察扩展已有独立复核 | 部分，所列修复已复核 |
+| M3 局部继续与托管 | 现有 worktree 上新 Run；恢复门与持久 typed recovery 处置；WaitState 绑定 Task/Plan/Run/Node、来源/条件/身份/基线；最近消费摘要映射、真实再次变化、显式修订清空去重、漏周期合并；新增 observationCurrent/assertObservation 复核执行与发布准入；维护专用 verification Run 和 observationDigest | 无文件前后状态 witness 和自动后置状态查证；真实强杀/休眠及完整后代收尾实验不足；独立发现的三个反例已修复，回归和独立复核通过；局部复用无完整输入证据；真实长期任务未运行。CI adapter 仍是原条件项，未实现 | 部分，本地托管局部交付已验证 |
 | M4 同题比较与交付 | 构建、打包、导出命令、CI 定义、原理与代码文档存在；已有交付记录另待最终远端回读 | 三类真实任务、充分配置的 1—2 个基线、人工总分钟/重复工作/用量/维护成本和继续使用意愿未记录；没有满足“至少两项降低人工总分钟”等投资门槛的材料 | 交付工程部分存在；比较验收缺失 |
 
 ## 3. T01—T20 验收逐项映射
@@ -40,7 +44,7 @@
 | ID | 当前代码/测试证据 | 缺口与所需证据 | 状态 |
 | --- | --- | --- | --- |
 | T01 | `service.ts` 的 `onTool` 拒绝 Planner 非读工具；`pi-worker.ts` 规划工具清单只有读取/控制；`validation.ts:validatePlan` 校验 DAG、依赖、ID、固定检查覆盖；`core.test.ts` 前两项、`runtime.test.ts` 首项 | Core fixture 仅主动试 write；缺实际 pi 对任意 shell/项目脚本的拒绝场景。输入、预期产物和来源允许为空/任意字符串，未校验必要前置问题与授权范围 | 部分 |
-| T02 | `onControl(update_plan)` 以 Run 内 draftSequence 拒绝旧草稿；提交只保存候选，Runner 收尾后在事务中核对 taskRevision/旧 planId/inputDigest 才建立 Plan 和 Ready；Core 新增候选提交后源变化拒绝发布、Ready 后变化重新规划的回归 | 截断 JSON/`stopReason=length`、重复乱序草稿和实际进程提交后强杀尚无完整集成断言；最新 Ready 变化测试终态及发布路径独立复核待回读 | 部分，发布门已修 |
+| T02 | `onControl(update_plan)` 以 Run 内 draftSequence 拒绝旧草稿；提交只保存候选，Runner 收尾后在事务中核对 taskRevision/旧 planId/inputDigest 才建立 Plan 和 Ready；候选提交后来源变化拒绝发布、Ready 后变化重规划的 Core 回归已有通过结果和独立复核 | 截断 JSON/`stopReason=length`、重复乱序草稿和实际进程提交后强杀尚无完整集成断言；这些剩余触发不能由现有来源变化测试替代 | 部分，发布门已修 |
 | T03 | IPC 严格 schema 不允许 Ready/status 字段；expectedRevision、一次性 host 签发 preview；`core.test.ts` 检查旧 revision、篡改/replay、取消后旧决定 | 没有绑定“人工开始所审阅 Plan 摘要/授权”的独立凭据；`task.resume` 仅 task revision，未测试同 TaskRevision 换 Plan 后晚到开始；计划授权校验仍不完整 | 部分 |
 | T04 | `task.create` 在同一 DB 事务保存 Task 和 requestId；重复请求返回同一 Task；requestId 参数冲突在 `Store.request` 拒绝 | 缺首次 pi 消息前真正终止宿主再启动的案例；现有恢复测试直接插入 running/pending 记录，不能证明该崩溃窗口。worktree 创建早于事务，可能留下未注册目录，已有代码文档披露 | 部分 |
 | T05 | `execution.test.ts` 覆盖路径越界、符号链接、受保护文件及祖先目录重命名；`workspace.test.ts` 覆盖 Git filters；Main 只读相对路径；执行全程进 helper | [安全边界](SECURITY.md) 已确认 detached/setsid 后代可以脱离进程组。文件/网络限制与全部后代效果停止是不同承诺，不能以“可信项目”说明替代原 oracle 的后代收尾 | 文件边界已有；完整效果边界未满足 |
@@ -50,15 +54,15 @@
 | T09 | `App.tsx` 订阅后读完整快照；规划开关只存 settings；主对话显示同一 Decision；UI fixture 验隐藏更新、节点/页签保留及主对话回答 | 当前测试没有销毁/重连 renderer 后恢复同一最新快照，也没有断连期间 worker 持续推进与无 submit 重发断言；selectedNode 被新版移除时只回退首节点，没有明确说明 | 部分 |
 | T10 | 预览先 `stop`，应用 preview 校验 revision、planId、workspaceDigest、原件和幂等 ID；旧 Plan 保留 | 目标变化测试发生在 Ready，非运行中改约束；缺旧 Worker 迟到事件与新版草稿竞争的集成测试；事件函数用当前 taskRevision/activePlan 默认值，需要按旧 Run 来源证明归属 | 部分 |
 | T11 | 单节点 retry 计算显式 DAG 下游；objective 变化保守失效所有节点 | 没有证明有效的独立分析复用。`inputs/outputs` 只是字符串；没有来源 hash、消费 artifact ID 或 unknown shell 输入模型。retry 对非下游保留只看连线，不先核对该节点实际输入是否改变 | 缺少核心能力 |
-| T12 | 新增 `CheckBatch` 和 `batchCurrent()`，同批绑定 taskRevision、planId、checksDigest、inputDigest；每条检查前后、批次结束、节点及最终提交均再核对；CheckReceipt 记录 batchId/scope/版本身份；Core 新增跨工作区版本检查不能拼成成功、最终回执后输入改变不能接受的回归 | 本轮固定来源修复已有当前测试及独立审查，但不能由此将原 oracle 的其他要求标通过；没有环境/外部来源向量。旧 CI 身份验证为原条件项“真实案例需要 CI 时”，尚无案例选择与 adapter 证据 | 修复已复核，其余条件项待验 |
+| T12 | `CheckBatch` 同批绑定 taskRevision、planId、checksDigest、inputDigest；检查前后、节点及最终提交复核；本轮新增已消费 Wait 的 observationDigest，`batchMatches()` 重读来源；Core 覆盖观察在检查后撤销导致节点失败、不设置 acceptedDigest | 工作区批次修复和本轮观察扩展均已有独立复核；单个本地 Wait 不等于完整环境/外部来源向量。CI 身份验证为原条件项“真实案例需要 CI 时”，尚无案例选择与 adapter 证据 | 所列修复与观察扩展已复核 |
 | T13 | CheckSpec 保留在 Task，不由模型计划覆盖；遗漏 check ID 阻止计划；protectedPaths 在工具和 sandbox 同时限制；旧人工接受摘要失效有测试 | 无用户修订固定验收 API，不能完成“中途改变一项验收”的真实题；检查文件变更目前混在 diff，缺专门有效性/覆盖说明；旧接受和最终累计补丁的进一步一致性与 T12/T18 一并复验 | 部分 |
 | T14 | previewRetry 停止任务，applyImpact 事务标所选及下游 stale，并清 acceptedDigest；新增恢复门，unknown 未处置时拒绝 preview/apply；用户保留当前文件后新 TaskRevision 重新规划，不 reset/stash/clean | 非 unknown 的外部改动在 retry 预览前仍未完整 reconcile，非 DAG 下游旧 verified 可能被保留；新 attempt 仍在之后 `run()` 单独事务登记；缺“人工修改＋活动下游＋旧 pass”完整端到端测试 | 部分 |
 | T15 | 启动 pending→unknown；新增 `unresolved/requireRecovery` 和共享 `executeRecorded`，恢复/影响变更/drive/固定检查/finalize 不能越过未处置效果，read/list/search unknown 不冻结；回执写失败关闭 admission 并 abort；未知命令阻止其他 Task 执行；typed recovery 绑定动作集合、工作区摘要、Plan/TaskRevision 和证据 artifact，持久 preserve-and-replan 或终态 preserve-and-stop，历史 status 仍为 unknown。Core 新回归覆盖新 toolCallId、影响路径、timer/其他任务、陈旧决定、终态处置与处置事务失败 | 尚无逐文件 before/after witness 和自动后置状态确认；恢复事实目前为用户处置，不能称自动证明已执行/未执行。真实强杀、启动窗口及任意后代收尾未全验；持续存储故障与保留后后续计划不重发旧语义操作仍需扩展证明 | 部分，恢复准入已实现 |
-| T16 | Set queue 合并同任务调度；一个 nextCheckAt；到期扫描跨重启持久化；一次错过周期不会创建多份排队记录 | 无登记 source/subject/condition，也无来源刷新、来源不可达 unknown、观测缺口。waiting_external 时间到即调用模型，不核对是否有新信息。维护变化会重新执行失效写节点；缺对应测试 | 缺少托管关键行为 |
-| T17 | 实际 turn.started 累加 task.turnCount；剩余 maxTurns 传每次 Run；Run timeout、绝对到期、取消都有测试；最后允许 turn 可完成有回归 | 未记录无进展 fingerprint/重复失败停止依据；没有任务总 elapsed 预算或每 Run 工具上限；反复 wait/重规划直到 turn budget 的路径未测。必须按原约定明确各预算覆盖，不以一个 maxTurns 代表全部 | 部分 |
+| T16 | `WaitState/readObservation/observeWait` 实现本地 source/condition/身份/基线、Run 收尾登记、consumedAt；consumedObservations 改为每节点/来源/条件的最近摘要映射，支持 A → B → A → B 和不满足后恢复相同内容；applyImpact/非终态恢复处置清空去重、events 留历史。observationCurrent/assertObservation 在 drive/Run/工具准入/发布/非恢复决定处复核；Set 合并 missedIntervals/gapSince；维护只运行固定 batch。Core/runtime/UI 对应回归已通过 | 三个原始独立反例复跑 3/3 通过，独立复核和重新打包态 smoke 均通过。真实休眠/强杀/自然隔夜任务仍缺。旧无来源 Wait 明确阻塞要求修订；CI adapter 未实现，仍按原案例条件触发 | 部分，本地等待/维护局部交付已验证 |
+| T17 | 实际 turn.started 累加 task.turnCount；剩余 maxTurns 传每次 Run；Run timeout、绝对到期、取消及最后允许 turn 完成有回归；新增相同信息重复等待不增加模型 Run、新信息释放后耗尽预算不再启动模型的断言；verification Run 无模型轮次 | 消费指纹覆盖等待信息，尚无通用无进展/重复失败停止依据；没有任务总 elapsed 预算或每 Run 工具上限；反复重规划的预算覆盖仍需验证。必须按原约定明确各预算覆盖，不以一个 maxTurns 代表全部 | 部分 |
 | T18 | SQLite 同步事务与内嵌 artifact；新增批次最终 CAS 及 `executeRecorded`：准入后抛错/回执事务失败记 unknown，Run 关闭准入并 abort，持续写库失败置内存 effectsFrozen。Core 已有 pending 写失败零执行、文件已写但回执丢失不再准入、artifact 提交失败不完成、恢复处置事务失败继续冻结，以及最终检查后变化回归 | 新故障路径已有当前测试和独立审查；现有注入以 Store.put 抛错为主，尚未证明真实 SQLite I/O 故障、磁盘满/强杀和持续恢复失败的全部窗口 | 修复/故障回归已复核，真实故障实验待验 |
 | T19 | 右侧 CSS、窄屏 drawer、inert、Escape、焦点返回；UI 测试检查右侧/焦点/溢出 | 测试宽度是 390/736/1024，原要求 360/736/1024；App minWidth=760，实际桌面不能在 736/360 复现同一壳；没有每宽全部面板组合和深浅主题对照 | 部分 |
-| T20 | system/zh-CN/en、独立 responseLanguage；UI 更新用 typed acceptance/recovery 决定选择中英文案、保留模型问题原文，并将缺失用量显示 Unavailable/Partial usage；原 UI/桌面 smoke 有两种语言切换 | 新文案和用量展示已有 UI 回归；宿主 `task.error`、impact.reason、capabilities.reason 仍需完整双语。尚未断言切换前后所有 ID/版本/命令集合不变或跨重启 locale 恢复 | 部分 |
+| T20 | system/zh-CN/en、独立 responseLanguage；typed acceptance/recovery 文案保留模型问题原文；缺失用量显示 Unavailable/Partial usage；新增等待/维护共享双语卡片、观察摘要和 verification Run 用量区分，UI 9 项已有通过结果 | 宿主 `task.error`、impact.reason、capabilities.reason 和原始来源错误仍需完整双语边界。尚未断言切换前后所有 ID/版本/命令集合不变或跨重启 locale 恢复 | 部分 |
 
 ## 4. L01—L16 与高阶实验
 
@@ -67,7 +71,7 @@
 | 实验 | 阶段适用性与当前证据 | 仍需完成的验证 | 状态 |
 | --- | --- | --- | --- |
 | L01 最小循环与流 | M1；`runtime.test.ts` 经真实 pi 和 loopback HTTP 读工具后第二轮提交；text_delta 与真实 session 文件存在 | 没有旧 partial 快照不随后续 token 变化的断言；fixture 流只发单段 content，再发结束 | 部分 |
-| L02 上下文与 payload | M1；worker 将 objective/checks/plan/node/context 送 prompt；HTTP fixture 捕获 requests | AGENTS/Skill 自动发现全部关闭，未有显式白名单材料注入或缺一资源的 payload 对照。Node 的上下文只有近 8 条 Run 摘要及已回答决定，没有已采用前驱产物内容/来源 | 缺少所约定实验与部分功能 |
+| L02 上下文与 payload | M1；worker 将 objective/checks/plan/node/context 送 prompt；HTTP fixture 捕获 requests；本轮 context 增加实际 Wait 来源、身份、时间、内容和消费记录，Core 断言内容进入后续 Run | AGENTS/Skill 自动发现全部关闭，未有显式白名单材料注入或缺一资源的 payload 对照。近 8 条 Run 摘要、决定和单个 Wait 仍不能替代已采用前驱产物内容/来源 | 缺少所约定实验与部分功能 |
 | L03 参数与权限 | M1；TypeBox 工具 schema、Zod IPC、helper 路径与预期 hash 有测试 | 没有数值字符串/非法额外字段/参数准备转换后的最终策略断言；未接 hook，不能声称其改参后重验已实验 | 部分 |
 | L04 顺序与并行 | M1 生产取 sequential；worker 和 Agent 显式 sequential，父 RPC Promise 串行 | 缺两延迟工具的完成顺序/模型结果顺序对照；并行不是生产必需，但学习实验未有可运行证据 | 部分 |
 | L05 阻止与终止 | M1；Planner write 拒绝、submit 后 read 未调用、文本不能完成 | 缺 allow/block/terminate 混合批次与后置 hook 不反转 deny 实验；生产未接 hook 不等于这项实验已通过 | 部分 |
@@ -79,7 +83,7 @@
 | L11 watch/重连 | M0/M2 产品层；App 全量 snapshot 与订阅通知，不由 UI 改执行状态 | 未测试先快照/插入事件竞争、销毁 UI 后 worker 持续与重连无 submit；Harness watch 后置 | 产品层部分 |
 | L12 回归/配方演进 | 原方案明确后置；没有 Skill 版本实验 | 非首版门槛，不要求添加自演进系统 | 原定后置 |
 | L13 规划权限/发布 | M1；见 T01/T02；真实 pi 清单与 Core DAG；新代码在 Runner 收尾后校验规划工作区和版本再 Ready，首节点前来源变化会重规划；相应 Core 回归已存在 | 缺无效/截断计划实际协议端到端、逐输入来源/产物契约及真实提交后强杀实验；本轮发布路径已独立复核 | 部分，发布门已修 |
-| L14 节点/前端归属 | M0/M2；Core 两节点回归、UI fixture、桌面单真实节点链；UI 新增按 planId/taskRevision/Run/批次标识区分 Current/Historical，并展开 batch/scope/检查定义摘要，恢复证据可在主对话查看 | 新 UI 尚在回归中；缺真实两节点与断 UI/重开整体链，当前有效性与后续节点修改输入仍需端到端证据 | 部分，证据展示更新中 |
+| L14 节点/前端归属 | M0/M2；Core 两节点回归、UI fixture、桌面单真实节点链；UI 按 planId/taskRevision/Run/批次区分 Current/Historical；maintenance scope、observationDigest、共享观察卡片及真实 consumedAt，最新 UI 9/9 通过 | 缺真实两节点与断 UI/重开整体链，当前有效性与后续节点修改输入仍需端到端证据；新增整体计划/todo/工具/决定逐步展示强化未完成 | 部分 |
 | L15 修订/失效 | M2；版本历史、签发影响预览、旧 revision 拒绝 | 合格分析复用、来源输入未变证明、未知依赖保守失效缺实现；晚到 pass 见 T12；UI fixture 的 retained research 为人工设定，不是 Core 计算证据 | 核心能力缺失/部分进行中 |
 | L16 局部继续 | M3；恢复门现已阻止未处置 unknown 后续运行，Core 回归包含用户文件变化使旧恢复决定失效、新决定保留文件后重新规划，以及同 Run 换 toolCallId 仍不重复效果 | 自动本地效果 witness 与真实强杀恢复尚缺；不能用 Core fixture 证明真实 pi/执行器/桌面整条恢复链或完整后代收尾 | 部分，恢复前置已实现 |
 
@@ -89,32 +93,35 @@ PTC、候选记忆有效性实验、多 Agent、跨仓/多人、云执行、第�
 
 | 要求 | 当前证据与边界 | 判定 |
 | --- | --- | --- |
-| 产品名字 | README、窗口、package 使用 Knotrail（程迹） | 已有 |
+| 产品名字 | README、窗口、package 使用 Knotrail | 已有 |
 | 基于 pi，参考 Codex 与 DSH | 真实使用 pi 0.85.1；Codex/DSH/Catdesk 布局来源有记录；主视图实际存在。DSH source/context/tool/check 仅四个静态说明，没有 profile/bundle 生命周期 | SDK 已有，借鉴实现部分 |
-| 可见规划全过程与节点产出 | draft event、最终 Plan、Run、工具事件、artifact/check 全由 Core 产生；旧 Plan 可选；CheckReceipt 已增加批次和版本身份，UI 正接入当前/历史展示 | 基本路径及新增证据身份已有；typed 输入、实际消费产物和完整有效性证明仍欠缺 |
+| 可见规划全过程与节点产出 | draft event、最终 Plan、Run、工具事件、artifact/check 全由 Core 产生；旧 Plan 可选；UI 已按检查批次和版本身份展示当前/历史记录，并补观察来源与维护批次 | 基本路径及新增证据身份已有；typed 输入、实际消费产物和完整有效性证明仍欠缺 |
 | 不能只呈现最终结果 | App 过程、活动、历史、检查、diff、事件展开均存在 | 已有 |
+| 强化整体计划、todo、工具调用和决定的逐步展示 | 用户新增要求：让任务执行中每一步的状态、内容、工具结果和决定依据更清楚；目前有 Plan/Run/动作/Decision 原始记录 | 展示强化仍在开发，不能用现有基础面板代替新增要求 |
 | 右侧规划独立开关 | UI 状态独立于 task 命令，开关默认关闭并持久化，主对话仍展示决定 | 已有；断连与精确宽度证据仍见 T09/T19 |
 | 原计划可修改任务目标/范围/必需验收 | `task.previewRevision` 只接受 objective；TaskRevision 虽存 checks，但每次复制旧检查；无用户修订 checks 的协议/表单 | 部分，固定验收修订缺失 |
 | 日常开发可运行 | 可以在干净 Git 源仓库建立普通文件 worktree；读写/argv/check 真执行 | 真实依赖升级与 API/页面/测试题未验证；symlink/submodule/未提交源修改明确拒绝，工具链依赖复现未覆盖 |
-| 详细原理文档 | `ARCHITECTURE.md` 解释进程、任务/Run/Plan、回执、检查、持久化、安全边界 | 文档存在；应在最终修复后同步，不可将缩小后的能力替代原需求 |
-| 详细代码文档 | `docs/CODE-GUIDE.md` 包含目录、IPC、调用链、工具、恢复、构建和测试；`USER-GUIDE.md` 有操作说明 | 已有；完成度审查指出的缺口须保留并随真实实现更新 |
-| 导出版本/节点/动作/检查引用一致 | `service.ts:report` 导出 Plan 摘要、checks、artifact Run/digest、event 文本；snapshot 已有检查批次身份与 unknown resolution/证据引用 | 本轮 Markdown report 已接入完整 ActionReceipt、Decision/处置及每条 check 的 Run/Node/TaskRevision/Plan/批次/定义摘要；尚无完整输入/覆盖向量，导出引用仍应随后续字段扩展验证 |
+| 详细原理文档 | `ARCHITECTURE.md` 解释进程、Task/Run/Plan、回执、检查、持久化、安全边界；本轮补来源/基线/消费、维护复验和漏查 | 已同步本轮修复和验证状态，不可用文档替代原要求 |
+| 详细代码文档 | `docs/CODE-GUIDE.md` 增加 Wait 控制参数、观察/维护函数链、持久字段和边界测试；`USER-GUIDE.md` 增加实际登记、来源边界、修复和漏查操作 | 已有；来源撤销/修订边界和全目标缺口仍保留 |
+| 导出版本/节点/动作/检查引用一致 | `service.ts:report` 导出 Plan、checks、artifact Run/digest、完整 ActionReceipt/Decision 处置；本轮加入 wait/health、观察事件历史与 CheckReceipt.observationDigest | 原有和新增身份字段已写入导出；尚无完整输入/覆盖向量，新字段及引用需在本轮最终导出验收中核对 |
 | 创建 public GitHub 并推送 | 仓库工作流和已有交付记录存在；此只读审查未执行 GitHub 操作 | 交付负责人最终回读 public/SHA/CI，不根据聊天认定 |
-| 最新 Astra 接入 | 自定义 provider modelId，无硬编码伪模型；真实线上配置入口存在 | 未做 Astra 服务工具调用；没有凭据时保持外部依赖，不能把 loopback fixture 说成 Astra 验收 |
+| 最新 Astra 与 Codex 账户登录接入 | 当前有自定义 provider modelId 和 API 配置；用户进一步要求使用已授权的 Codex 账户会话实际验证 | 登录适配仍在开发，真实 Astra 工具调用未验；不能把订阅登录当 API key，也不能将 loopback fixture 说成 Astra 验收 |
+| 本机安装后实际使用验收 | 用户新增要求在实现完成后安装到本机，并通过实际授权会话完成真实任务 | 本机安装和该路径的实测尚未完成；旧打包 smoke 不能替代安装、登录、实际开发链路验收 |
 | 我们有何优势/业内价值 | 原方案有明确假设与竞品研究 | 没有自然任务数据支持实际优势；必须完成 M4 同题比较，不能从更完整流程图推出成本更低 |
 
 ## 6. 优先继续实现的工作
 
 以下是当前无需真实 API key 就可推进的工作，按阻止假成功/重复效果的优先级排列。不是新增路线，也不是缩小用户要求。
 
-1. **独立复核已实现的 T12/T18 批次和存储修复。** 同一 Plan、TaskRevision、检查定义和来源摘要已进入 CheckBatch，节点和最终提交会再核对；pending/回执/artifact/恢复处置失败回归已加入。下一步读取最终测试输出，独立检查实际竞争窗口及持续存储故障，不再把该功能记为未实现。
+1. **补足 T12/T18 的真实故障证据。** 工作区批次、存储修复及本轮观察修复已有独立复核和打包态验证；最新 check 60 项中 59 通过、1 项预期跳过。后续构造真实 SQLite I/O、磁盘满和强杀窗口，不能将 Store.put 注入或当前通过结果当作这些实验已经完成。
 2. **补全已有 unknown 恢复门的自动查证和真实故障证据。** 普通 Resume、影响变更、drive/wake、固定检查及完成入口现已受门控制，未知命令冻结其他 Task，用户处置绑定动作、Plan/版本、workspaceDigest 和 artifact，原 unknown 历史保留。下一步为确定性文件操作保存前后 witness，只自动确认确实可证明的当前后置状态；命令仍由用户查证处置。补实际强杀和保留后不盲目重发旧效果的端到端验证。
 3. **建立最小、可验证的输入和产物引用。** 对研究节点保存读取文件摘要、节点语义、实际产物 ID；Node prompt 带入有效前驱产物。改目标或 retry 时只复用证据仍适用的分析节点；shell 隐含覆盖或共享文件不明则说明原因并扩大重读/复验。不能先按 DAG 保留，再假设输入没变。
 4. **验证已实现的候选与 Ready 分离，并补齐输入契约。** 新代码已在 Runner 收尾后复核 TaskRevision/旧 Plan/工作区来源，Ready 后首节点前变化也会重规划；相应 Core 回归已增加。下一步补截断草稿、迟到旧事件、真实提交后强杀，及声明输入/产物/必要条件的校验。
 5. **补齐用户固定验收修订。** 在现有影响预览中增加 checks/范围的明确变更，保存新 TaskRevision、保护路径与检查定义，旧验收失效。模型只能提案，不能移除用户必需条件。用“功能中途修改一项验收”的受控案例验证。
-6. **实现托管观测，而非纯时间重跑。** 给 Wait 记录最小 source/subject/condition 和最后观察摘要；到期/启动/唤醒先刷新来源，合并相同事件；不变则保持等待，无法观察则 unknown；维护只先跑固定检查，失败显示 unhealthy/需要处理，不直接重放写节点。测试多个错过周期、来源不可达、自身写入与无新信息。
-7. **完成正在更新的双语与证据展示。** typed acceptance/recovery、中英处置文案、恢复 artifact、当前/历史检查和不完整用量现已写入 UI。继续补 Core 自有错误/影响原因的本地化、移除节点解释回退，并执行 360 px、暗色、重载偏好、原文/命令不变及完整恢复交互回归。
+6. **完成本地 Wait 与维护路径的验收。** 来源/条件/基线、最近消费映射、漏周期、unknown 观察和专用固定维护检查已经实现，来源撤销与修订去重反例已修复。本轮独立复核和打包态验证已通过；继续验证真实启动/休眠、强杀恢复、期限/暂停/取消竞争和完整导出；用隔夜变化任务确认多次观察。CI 平台只读 adapter 仍按真实案例是否需要触发，不把本地状态文件视为 CI 身份验证。
+7. **强化逐步工作展示并补足双语。** typed acceptance/recovery、恢复 artifact、当前/历史检查、观察消费时间、托管 Pause 和不完整用量已有 UI 回归。落实用户新增的整体计划/todo/工具调用/决定逐步展示；继续补 Core 自有错误/影响原因本地化、移除节点解释，并验证 360 px、暗色、重载偏好、原文/命令不变及完整恢复交互。
 8. **准备真实题和同题比较材料。** 建立两个真实小项目题及隔夜变化题，固定起点、检查、约束变更时机、授权、预算、记录格式；先用协议 fixture 验证收集链，随后接真实模型，允许基线使用其成熟计划/项目规则。记录人工总分钟、重复工作、验收准确性、总用量和失败，不能将合成脚本收益替换自然使用结果。
+9. **完成账户接入、本机安装与实际使用验收。** 实现用户授权的 Codex 登录路径，准确区分会话认证与 API key；打包后安装到本机，用实际可用模型完成真实任务并记录结果。公开材料只记录能力、配置类型和结果，不记录真实凭据、会话私有内容或本机私有路径。
 
 宿主后代终止缺口也必须解决或保持明确未完成：原方案要求隔离不成立时在 VM/container 中继续实验，未授权把要求降为“仅普通子进程”。可先对本地 sandbox 的限制构造持续回归、选择一个可实现的隔离后端并验证真实工具链；不要仅修改安全说明后标 T05/T06/T07 完成。
 
@@ -125,5 +132,6 @@ PTC、候选记忆有效性实验、多 Agent、跨仓/多人、云执行、第�
 - 最终代码经适用测试、真实 macOS 打包态启动及关键任务链验证；安全收尾、未知效果和过期验收等已知失败路径修复后独立复核。
 - 两个真实开发题和隔夜变化题有当前输入上的固定验收、必要人工审阅和全过程产物；强基线比较有版本/配置/成本口径及实际结果，允许结果“不占优势”。
 - 最终原理/代码/使用/安全/验证文档与实现一致；不再用“待实施”正文和已交付声明互相覆盖；公开仓库最终 SHA、public 状态与 CI 读回一致。
+- 用户新增的整体计划/todo/工具调用/决定逐步展示有实际界面验收；本机安装、Codex 登录和真实模型任务分别有完成证据，不能由构建或协议替身替代。
 
 在上述证据齐备前，应报告“可运行工程已交付，完整原方案继续实现”，不能把该状态改写为“全部完成，只差填写 API key”。

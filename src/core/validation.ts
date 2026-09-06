@@ -3,6 +3,7 @@ import type { AppCommand, PlanDraft, CheckSpec } from '../shared/contracts.js';
 const text=z.string().min(1).max(32_000), key=z.string().min(1).max(200), revision=z.number().int().positive();
 const path=z.string().min(1).max(4096).refine(p=>!p.startsWith('/')&&!p.split(/[\\/]/).some(s=>s==='..'||s==='.git')&&!p.includes('\0'),'Expected a safe relative path');
 export const checksSchema=z.array(z.object({id:key,label:text,command:z.array(z.string().max(8192)).min(1).max(100),protectedPaths:z.array(path).max(100)}).strict()).max(30).refine(v=>new Set(v.map(x=>x.id)).size===v.length,'Check IDs must be unique');
+export const waitSchema=z.object({kind:z.literal('wait'),reason:text,minutes:z.number().int().min(1).max(43200),source:z.object({kind:z.enum(['workspace_file','project_file']),path}).strict(),condition:z.union([z.object({kind:z.enum(['changed','exists'])}).strict(),z.object({kind:z.literal('contains'),text:z.string().min(1).max(4096)}).strict()])}).strict();
 const secret=z.string().max(8192);
 const prefs=z.object({panelView:z.enum(['process','steps']),selectedNode:key.optional(),detailTab:z.enum(['overview','artifacts','checks','history']),mainView:z.enum(['chat','activity','changes']),toolPanel:z.enum(['files','terminal','preview']).nullable(),graphView:z.enum(['graph','list']),draft:z.string().max(32_000)}).strict();
 const impact=z.object({id:key,taskId:key,expectedRevision:revision,expectedPlanId:key.optional(),workspaceDigest:key,objective:text.optional(),nodeId:key.optional(),affected:z.array(key),retained:z.array(key),reason:text}).strict();

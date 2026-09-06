@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSync, chmodSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -25,7 +25,7 @@ async function setup(t:test.TestContext,runner:Runner=new FixtureRunner()){
  const env={...process.env,GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_NOSYSTEM:'1',GIT_AUTHOR_NAME:'Fixture',GIT_AUTHOR_EMAIL:'fixture@example.org',GIT_COMMITTER_NAME:'Fixture',GIT_COMMITTER_EMAIL:'fixture@example.org'};
  for(const args of [['init'],['add','.'],['commit','-m','fixture']])execFileSync('git',args,{cwd:source,env,stdio:'ignore'});
  let secret:string|undefined;const app=createAppService({dataDir,secretStore:{get:()=>secret,set:v=>{secret=v;}},notify:()=>{},capabilities:{sandbox:true,platform:'darwin'},lockFd:-1,runner,executor});
- t.after(async()=>{await app.shutdown();rmSync(root,{recursive:true,force:true});});
+ t.after(async()=>{if(!(app as any).closing)await app.shutdown();rmSync(root,{recursive:true,force:true});});
  await app.command({type:'settings.save',patch:{model:{baseUrl:'http://127.0.0.1:12345/v1',modelId:'fixture'}}});const project=await app.command({type:'project.add',path:source}) as Project;
  return {app,source,dataDir,project,runner};
 }
@@ -150,4 +150,138 @@ test('foreign unknown commands cannot turn a terminal task into a resumable task
  const b=await app.command(create(project)) as TaskSnapshot;await until(app,b.task.id,s=>s.task.status==='ready');uncertainAction(app,b.task.id,'run_command');await app.command({type:'task.cancel',taskId:b.task.id,expectedRevision:1});
  const inspected=await app.command({type:'task.inspectEffects',taskId:a.task.id}) as TaskSnapshot;assert.equal(inspected.task.status,'cancelled');assert.equal(inspected.runs.length,1);
  const recovery=await app.command({type:'task.inspectEffects',taskId:b.task.id}) as TaskSnapshot;await app.command({type:'decision.answer',requestId:id(),taskId:b.task.id,decisionId:recovery.decisions.find(d=>d.kind==='recovery')!.id,answer:'preserve-and-stop',expectedRevision:1});await assert.rejects(app.command({type:'task.resume',taskId:a.task.id,expectedRevision:1}),/terminal/);
+});
+
+class WaitRunner extends FixtureRunner {
+ waited=false;contexts:string[]=[];
+ constructor(readonly source:'workspace_file'|'project_file'='project_file',readonly condition:'changed'|'exists'|'contains'='contains'){super();}
+ override async run(r:RunnerRequest,c:RunnerCallbacks,signal:AbortSignal){
+  this.contexts.push(r.context);
+  if(r.purpose==='node'&&!this.waited){this.waited=true;this.count++;if(this.source==='workspace_file')await c.onTool({toolCallId:id(),name:'write_file',args:{path:'sample.txt',content:'self-written\n'}});await c.onControl({kind:'wait',reason:'Wait for the declared source',minutes:1,source:{kind:this.source,path:this.source==='project_file'?'signal.txt':'sample.txt'},condition:this.condition==='contains'?{kind:'contains',text:'ready'}:{kind:this.condition}});return {summary:'waiting',turns:1,usage:{input:4,output:2},aborted:signal.aborted};}
+  return super.run(r,c,signal);
+ }
+}
+function due(app:AppService,taskId:string,missedMinutes=0){app.store.update(taskId,s=>{s.task.nextCheckAt=new Date(Date.now()-missedMinutes*60000-10).toISOString();});for(let i=0;i<12;i++)(app as any).wake();}
+test('file waits coalesce missed observations, preserve unknown sources, and wake only on new qualifying information',async t=>{
+ const runner=new WaitRunner(),{app,project,source}=await setup(t,runner);const created=await app.command(create(project,{mode:'finite',intervalMinutes:1,expiresAt:new Date(Date.now()+3600000).toISOString(),executionPolicy:'autoWithinGrant'})) as TaskSnapshot;
+ const waiting=await until(app,created.task.id,s=>s.task.status==='waiting_external');assert.equal(waiting.task.wait?.source.path,'signal.txt');
+ due(app,created.task.id,4);const unchanged=await until(app,created.task.id,s=>s.task.status==='waiting_external'&&Date.parse(s.task.nextCheckAt!)>Date.now());assert.equal(unchanged.task.status,'waiting_external');assert.equal(unchanged.task.wait!.last.missedIntervals,4);assert.equal(runner.count,2);
+ mkdirSync(join(source,'signal.txt'));due(app,created.task.id);const unavailable=await until(app,created.task.id,s=>s.task.wait?.last.status==='unknown');assert.equal(unavailable.task.status,'waiting_external');assert.equal(runner.count,2);
+ rmSync(join(source,'signal.txt'),{recursive:true});writeFileSync(join(source,'signal.txt'),'ready with an external change\n');due(app,created.task.id);const done=await until(app,created.task.id,s=>['completed','blocked'].includes(s.task.status));assert.equal(done.task.status,'completed');assert.equal(runner.count,4);assert.ok(runner.contexts.at(-2)!.includes('ready with an external change'));assert.equal(done.events.filter(e=>e.kind==='wait.satisfied').length,1);
+});
+test('self writes establish the wait baseline and pause/resume without new input does not spend model turns',async t=>{
+ const runner=new WaitRunner('workspace_file','changed'),{app,project}=await setup(t,runner);const created=await app.command(create(project,{mode:'finite',intervalMinutes:1,expiresAt:new Date(Date.now()+3600000).toISOString(),executionPolicy:'autoWithinGrant'})) as TaskSnapshot;
+ const waiting=await until(app,created.task.id,s=>s.task.status==='waiting_external');assert.ok(waiting.task.wait?.baselineDigest);due(app,created.task.id);await until(app,created.task.id,s=>Date.parse(s.task.nextCheckAt!)>Date.now());assert.equal(runner.count,2);
+ await app.command({type:'task.pause',taskId:created.task.id,expectedRevision:1});await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const resumed=await until(app,created.task.id,s=>s.task.status==='waiting_external'&&!!s.task.nextCheckAt);assert.equal(resumed.task.turnCount,2);assert.equal(runner.count,2);assert.equal(readFileSync(join(resumed.task.workdir,'sample.txt'),'utf8'),'self-written\n');
+});
+test('maintenance verifies current files without replaying edit nodes and records unhealthy until repaired externally',async t=>{
+ const {app,project,runner}=await setup(t);const created=await app.command(create(project,{mode:'maintain',intervalMinutes:1,executionPolicy:'autoWithinGrant'})) as TaskSnapshot;const healthy=await until(app,created.task.id,s=>s.task.status==='healthy');const modelRuns=(runner as FixtureRunner).count;
+ (app as any).executor={async execute(...args:Parameters<Executor['execute']>){const result=await executor.execute(...args);return {...result,exitCode:result.isError?1:0};}};
+ writeFileSync(join(healthy.task.workdir,'sample.txt'),'user changed this\n');due(app,created.task.id,3);const unhealthy=await until(app,created.task.id,s=>s.task.status==='unhealthy'||s.task.status==='blocked');assert.equal(unhealthy.task.status,'unhealthy');assert.equal(unhealthy.task.health?.missedIntervals,3);assert.equal((runner as FixtureRunner).count,modelRuns);assert.equal(readFileSync(join(healthy.task.workdir,'sample.txt'),'utf8'),'user changed this\n');assert.equal(unhealthy.task.acceptedDigest,undefined);assert.equal(unhealthy.runs.at(-1)?.purpose,'verification');assert.ok(unhealthy.checks.some(c=>c.scope==='maintenance'&&c.runId===unhealthy.runs.at(-1)!.id));
+ writeFileSync(join(healthy.task.workdir,'sample.txt'),'updated\n');due(app,created.task.id);const restored=await until(app,created.task.id,s=>s.task.status==='healthy');assert.equal((runner as FixtureRunner).count,modelRuns);assert.equal(restored.task.health!.inputDigest,restored.task.acceptedDigest);
+});
+
+
+test('already satisfied input advances once and repeated waits cannot bypass consumption through resume',async t=>{
+ class RepeatWaitRunner extends FixtureRunner {
+  override async run(r:RunnerRequest,c:RunnerCallbacks,signal:AbortSignal){
+   if(r.purpose==='planning')return super.run(r,c,signal);this.count++;
+   await c.onControl({kind:'wait',reason:'Waiting for ready input',minutes:1,source:{kind:'project_file',path:'signal.txt'},condition:{kind:'contains',text:'ready'}});
+   return {summary:'waiting',turns:1,usage:{input:4,output:2},aborted:signal.aborted};
+  }
+ }
+ const runner=new RepeatWaitRunner(),{app,project,source}=await setup(t,runner);
+ const created=await app.command(create(project,{mode:'finite',intervalMinutes:1,expiresAt:new Date(Date.now()+3600000).toISOString(),maxTurns:3})) as TaskSnapshot;
+ await until(app,created.task.id,s=>s.task.status==='ready');writeFileSync(join(source,'signal.txt'),'ready v1');await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});
+ const waiting=await until(app,created.task.id,s=>s.task.status==='waiting_external'&&s.runs.length===3);
+ assert.equal(Object.keys(waiting.task.consumedObservations??{}).length,1);assert.equal(waiting.task.wait?.consumedAt,undefined);assert.equal(waiting.task.wait?.last.status,'satisfied');
+ await app.command({type:'task.pause',taskId:created.task.id,expectedRevision:1});await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});
+ const resumed=await until(app,created.task.id,s=>s.task.status==='waiting_external'&&Date.parse(s.task.nextCheckAt!)>Date.now());assert.equal(runner.count,3);
+ due(app,created.task.id);await until(app,created.task.id,s=>Date.parse(s.task.nextCheckAt!)>Date.now());assert.equal(runner.count,3);
+ writeFileSync(join(source,'signal.txt'),'ready v2');due(app,created.task.id);const exhausted=await until(app,created.task.id,s=>s.task.status==='blocked');assert.match(exhausted.task.error!,/budget/);assert.equal(runner.count,3);assert.equal(exhausted.events.filter(e=>e.kind==='wait.satisfied').length,2);
+});
+
+test('wait observations distinguish absent files from unreadable, oversized and replaced sources',async t=>{
+ const runner=new WaitRunner('project_file','changed'),{app,project,source}=await setup(t,runner);
+ const created=await app.command(create(project,{mode:'finite',intervalMinutes:1,expiresAt:new Date(Date.now()+3600000).toISOString()})) as TaskSnapshot;
+ await until(app,created.task.id,s=>s.task.status==='ready');writeFileSync(join(source,'signal.txt'),'before');await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const waiting=await until(app,created.task.id,s=>s.task.status==='waiting_external');
+ const observe=()=>{const s=app.store.get(created.task.id);return (app as any).readObservation(s,s.task.wait,s.task.wait);};
+ chmodSync(join(source,'signal.txt'),0);assert.equal(observe().status,'unknown');chmodSync(join(source,'signal.txt'),0o600);
+ writeFileSync(join(source,'signal.txt'),'x'.repeat(32001)+'ready');assert.equal(observe().status,'unknown');
+ rmSync(join(source,'signal.txt'));symlinkSync('absent-target',join(source,'signal.txt'));assert.equal(observe().status,'unknown');rmSync(join(source,'signal.txt'));
+ assert.equal(observe().status,'satisfied');assert.equal(observe().digest,null);
+ renameSync(source,source+'-previous');mkdirSync(source);assert.equal(observe().status,'unknown');rmSync(source,{recursive:true});renameSync(source+'-previous',source);
+ due(app,created.task.id);const done=await until(app,created.task.id,s=>['completed','blocked'].includes(s.task.status));assert.equal(done.task.status,'completed');assert.ok(done.checks.every(c=>c.observationDigest));assert.ok(waiting.task.wait!.sourceIdentity);
+});
+
+test('verification rejects a consumed observation that changes after its checks',async t=>{
+ const runner=new WaitRunner(),{app,project,source}=await setup(t,runner);const created=await app.command(create(project,{mode:'finite',intervalMinutes:1,expiresAt:new Date(Date.now()+3600000).toISOString(),executionPolicy:'autoWithinGrant'})) as TaskSnapshot;
+ await until(app,created.task.id,s=>s.task.status==='waiting_external');
+ const put=app.store.put.bind(app.store);let changed=false;app.store.put=s=>{put(s);if(!changed&&s.checks.some(c=>c.observationDigest)){changed=true;writeFileSync(join(source,'signal.txt'),'revoked');}};
+ writeFileSync(join(source,'signal.txt'),'ready');due(app,created.task.id);const blocked=await until(app,created.task.id,s=>s.task.status==='blocked');assert.equal(changed,true);assert.equal(blocked.task.acceptedDigest,undefined);assert.equal(blocked.nodes[0]!.status,'failed');assert.equal(blocked.runs.length,3);
+});
+
+test('maintenance requires checks and records interrupted or changing verification as unknown',async t=>{
+ const {app,project,runner}=await setup(t);await assert.rejects(app.command(create(project,{mode:'maintain',intervalMinutes:1,checks:[]})),/requires at least one/);
+ const created=await app.command(create(project,{mode:'maintain',intervalMinutes:1,executionPolicy:'autoWithinGrant',maxTurns:3})) as TaskSnapshot;const healthy=await until(app,created.task.id,s=>s.task.status==='healthy');
+ (app as any).executor={async execute(){writeFileSync(join(healthy.task.workdir,'sample.txt'),'changed during check');return {text:'check passed before change',exitCode:0};}};due(app,created.task.id);const stale=await until(app,created.task.id,s=>s.task.status==='unknown');assert.equal(stale.task.health?.status,'unknown');assert.equal(stale.task.acceptedDigest,undefined);assert.equal((runner as FixtureRunner).count,3);
+ (app as any).executor={async execute(){return {text:'command did not establish an exit status',isError:true};}};due(app,created.task.id);const interrupted=await until(app,created.task.id,s=>s.runs.filter(r=>r.purpose==='verification').length===2&&s.task.status==='unknown');assert.equal(interrupted.checks.at(-1)!.result,'unknown');assert.equal(interrupted.actions.at(-1)!.status,'unknown');
+ due(app,created.task.id);const recovery=await until(app,created.task.id,s=>s.task.status==='waiting_user');assert.equal(recovery.decisions.at(-1)!.kind,'recovery');assert.equal((runner as FixtureRunner).count,3);
+});
+
+
+test('durable waits catch up after reconstruction and preserve a release saved before the next Run',async t=>{
+ for(const point of ['due','released']){
+  const runner=new WaitRunner(),{app,project,source}=await setup(t,runner);const created=await app.command(create(project,{mode:'finite',intervalMinutes:1,expiresAt:new Date(Date.now()+3600000).toISOString(),executionPolicy:'autoWithinGrant'})) as TaskSnapshot;
+  await until(app,created.task.id,s=>s.task.status==='waiting_external');await (app as any).stop(created.task.id);
+  writeFileSync(join(source,'signal.txt'),'ready after restart');app.store.update(created.task.id,s=>{s.task.nextCheckAt=new Date(Date.now()-5*60000-10).toISOString();});
+  if(point==='released')assert.equal((app as any).observeWait(created.task.id),true);
+  // Reconstruct a persisted boundary with no active effect. Real process-kill coverage is separate.
+  (app as any).closing=true;clearInterval((app as any).timer);app.store.close();
+  const reconstructed=createAppService((app as any).options);
+  try{
+   if(point==='released'){const recovered=reconstructed.store.get(created.task.id);assert.equal(recovered.task.status,'blocked');assert.ok(recovered.task.wait?.consumedAt);await reconstructed.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});}
+   const done=await until(reconstructed,created.task.id,s=>s.task.status==='completed');assert.equal(runner.count,4);assert.equal(done.events.filter(e=>e.kind==='wait.satisfied').length,1);assert.equal(done.task.wait?.last.missedIntervals,5);
+  }finally{await reconstructed.shutdown();}
+ }
+});
+
+test('a released wait must be reobserved before resumed model effects',async t=>{
+ const runner=new WaitRunner(),{app,project,source}=await setup(t,runner);
+ const created=await app.command(create(project,{mode:'finite',intervalMinutes:1,expiresAt:new Date(Date.now()+3600000).toISOString(),executionPolicy:'autoWithinGrant'})) as TaskSnapshot;
+ await until(app,created.task.id,s=>s.task.status==='waiting_external');await (app as any).stop(created.task.id);
+ writeFileSync(join(source,'signal.txt'),'ready');app.store.update(created.task.id,s=>s.task.nextCheckAt=new Date(0).toISOString());assert.equal((app as any).observeWait(created.task.id),true);
+ await app.command({type:'task.pause',taskId:created.task.id,expectedRevision:1});writeFileSync(join(source,'signal.txt'),'revoked');
+ await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const end=await until(app,created.task.id,s=>['blocked','waiting_external','completed'].includes(s.task.status));
+ assert.equal(readFileSync(join(end.task.workdir,'sample.txt'),'utf8'),'original\n','revoked source must not admit a resumed write');assert.equal(runner.count,2);
+});
+test('explicit new objective can consume the existing qualifying source once',async t=>{
+ class Repeat extends FixtureRunner {override async run(r:RunnerRequest,c:RunnerCallbacks,signal:AbortSignal){if(r.purpose==='planning')return super.run(r,c,signal);this.count++;await c.onControl({kind:'wait',reason:'Need current readiness',minutes:1,source:{kind:'project_file',path:'signal.txt'},condition:{kind:'contains',text:'ready'}});return {summary:'wait',turns:1,usage:{input:4,output:2},aborted:signal.aborted};}}
+ const runner=new Repeat(),{app,project,source}=await setup(t,runner);const created=await app.command(create(project,{mode:'finite',intervalMinutes:1,expiresAt:new Date(Date.now()+3600000).toISOString()})) as TaskSnapshot;
+ await until(app,created.task.id,s=>s.task.status==='ready');writeFileSync(join(source,'signal.txt'),'ready');await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});await until(app,created.task.id,s=>s.task.status==='waiting_external'&&s.runs.length===3);
+ const preview=await app.command({type:'task.previewRevision',taskId:created.task.id,expectedRevision:1,objective:'A different user-authorized objective using current readiness'}) as ImpactPreview;await app.command({type:'task.applyImpact',requestId:id(),preview});await until(app,created.task.id,s=>s.task.status==='ready'&&s.task.revision===2);
+ await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:2});await until(app,created.task.id,s=>s.task.status==='waiting_external'&&s.runs.length>=5);await new Promise(r=>setTimeout(r,50));assert.equal(runner.count,6);
+});
+test('a later real A-B-A-B source transition is new information',async t=>{
+ class RepeatChanged extends FixtureRunner {override async run(r:RunnerRequest,c:RunnerCallbacks,signal:AbortSignal){if(r.purpose==='planning')return super.run(r,c,signal);this.count++;await c.onControl({kind:'wait',reason:'Wait for next status transition',minutes:1,source:{kind:'project_file',path:'signal.txt'},condition:{kind:'changed'}});return {summary:'wait',turns:1,usage:{input:4,output:2},aborted:signal.aborted};}}
+ const runner=new RepeatChanged(),{app,project,source}=await setup(t,runner);const created=await app.command(create(project,{mode:'finite',intervalMinutes:1,expiresAt:new Date(Date.now()+3600000).toISOString()})) as TaskSnapshot;
+ await until(app,created.task.id,s=>s.task.status==='ready');writeFileSync(join(source,'signal.txt'),'A');await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});await until(app,created.task.id,s=>s.task.status==='waiting_external');
+ writeFileSync(join(source,'signal.txt'),'B');due(app,created.task.id);await until(app,created.task.id,s=>s.task.status==='waiting_external'&&s.runs.length===3);
+ writeFileSync(join(source,'signal.txt'),'A');due(app,created.task.id);await until(app,created.task.id,s=>s.task.status==='waiting_external'&&s.runs.length===4);
+ writeFileSync(join(source,'signal.txt'),'B');due(app,created.task.id);await until(app,created.task.id,s=>s.task.status==='waiting_external'&&Date.parse(s.task.nextCheckAt!)>Date.now());assert.equal(runner.count,5);
+});
+
+
+test('source revocation during a Run blocks tool admission before any write',async t=>{
+ const runner=new WaitRunner(),{app,project,source}=await setup(t,runner);const created=await app.command(create(project,{mode:'finite',intervalMinutes:1,expiresAt:new Date(Date.now()+3600000).toISOString(),executionPolicy:'autoWithinGrant'})) as TaskSnapshot;
+ await until(app,created.task.id,s=>s.task.status==='waiting_external');let entered!:()=>void,release!:()=>void;const started=new Promise<void>(resolve=>{entered=resolve;}),released=new Promise<void>(resolve=>{release=resolve;});runner.pause={entered,released};writeFileSync(join(source,'signal.txt'),'ready');due(app,created.task.id);await started;
+ writeFileSync(join(source,'signal.txt'),'revoked');release();const blocked=await until(app,created.task.id,s=>s.task.status==='blocked');assert.equal(readFileSync(join(blocked.task.workdir,'sample.txt'),'utf8'),'original\n');assert.equal(blocked.actions.length,0);assert.equal(blocked.task.acceptedDigest,undefined);
+});
+
+test('a false condition followed by the same qualifying content is new observed information',async t=>{
+ class Repeating extends FixtureRunner {override async run(r:RunnerRequest,c:RunnerCallbacks,signal:AbortSignal){if(r.purpose==='planning')return super.run(r,c,signal);this.count++;await c.onControl({kind:'wait',reason:'Ready condition',minutes:1,source:{kind:'project_file',path:'signal.txt'},condition:{kind:'contains',text:'ready'}});return {summary:'wait',turns:1,usage:{input:4,output:2},aborted:signal.aborted};}}
+ const runner=new Repeating(),{app,project,source}=await setup(t,runner);const created=await app.command(create(project,{mode:'finite',intervalMinutes:1,expiresAt:new Date(Date.now()+3600000).toISOString()})) as TaskSnapshot;
+ await until(app,created.task.id,s=>s.task.status==='ready');writeFileSync(join(source,'signal.txt'),'ready');await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});await until(app,created.task.id,s=>s.task.status==='waiting_external'&&s.runs.length===3);
+ writeFileSync(join(source,'signal.txt'),'not yet');due(app,created.task.id);await until(app,created.task.id,s=>s.task.wait?.last.status==='waiting');assert.equal(runner.count,3);
+ writeFileSync(join(source,'signal.txt'),'ready');due(app,created.task.id);await until(app,created.task.id,s=>s.task.status==='waiting_external'&&s.runs.length===4);assert.equal(runner.count,4);
 });

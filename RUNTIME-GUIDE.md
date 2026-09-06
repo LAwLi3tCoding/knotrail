@@ -1,4 +1,4 @@
-# Knotrail（程迹）：从 pi 理解 Agent Runtime v3.1
+# Knotrail：从 pi 理解 Agent Runtime v3.1
 
 > 交付更新（2026-09-06）：可运行的 v0.1.0 已实现。本文保留设计与研究背景，当前能力、限制和验收以 [README](README.md)、[实现架构](ARCHITECTURE.md) 与 [验证报告](docs/VALIDATION.md) 为准。
 本文是源码阅读与拟实施实验路线，实验尚未运行。固定源码：[pi 47236c84450656043dd8fb21c8513d1421505ae3](https://github.com/earendil-works/pi/tree/47236c84450656043dd8fb21c8513d1421505ae3)。目标是能追踪、解释和修改实际执行机制，而非仅会调用 `prompt()`。

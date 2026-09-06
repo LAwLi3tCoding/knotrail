@@ -79,3 +79,12 @@ test('real pi usage stays unknown or partial when provider responses omit token 
   assert.equal(result.turns,2);if(reported[0])assert.deepEqual(result.usage,{input:12,output:8,partial:true});else assert.equal(result.usage,undefined);
  }
 });
+
+
+test('real pi wait outcome requires a source and condition and closes later tool admission',async t=>{
+ const f=await fixture(t,[[{name:'outcome',args:{kind:'wait',reason:'Waiting for input',minutes:1}}],[{name:'outcome',args:{kind:'wait',reason:'Waiting for input',minutes:1,source:{kind:'project_file',path:'status.txt'},condition:{kind:'contains',text:'ready'}}},{name:'write_file',args:{path:'late.txt',content:'must not execute',expectedContent:null}}]]);
+ const controls:RunControl[]=[],tools:ToolCall[]=[];
+ const result=await new PiRunner().run({...f.request,purpose:'node'}, {onEvent(){},onTool:async c=>{tools.push(c);return {text:'unexpected'};},onControl:async c=>{controls.push(c);return {text:'accepted'};}},new AbortController().signal);
+ assert.equal(result.turns,2);assert.equal(controls.length,1);assert.deepEqual(controls[0],{kind:'wait',reason:'Waiting for input',minutes:1,source:{kind:'project_file',path:'status.txt'},condition:{kind:'contains',text:'ready'}});assert.equal(tools.length,0);
+ assert.ok(JSON.stringify(f.requests[1].messages).includes('source'));
+});

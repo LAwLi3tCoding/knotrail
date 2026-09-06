@@ -1,4 +1,4 @@
-# Knotrail（程迹）：架构与执行协议 v3.1
+# Knotrail：架构与执行协议 v3.1
 
 状态：2026-09-05，待实施设计。本版以 Codex 为主要桌面参照，结合 DSH 和本地 Catdesk 的页面布局；先规划后执行、独立右侧规划栏、双语界面和节点过程均为必需能力，替代 v2 的 CLI 先行路线。产品见 [PRODUCT-BRIEF.md](../PRODUCT-BRIEF.md)，界面见 [UI-DESIGN.md](../UI-DESIGN.md)，取舍与验证见 [COMPARISON.md](../COMPARISON.md)、[IMPLEMENTATION-PLAN.md](../IMPLEMENTATION-PLAN.md)。本文接口是拟定应用协议，不是 pi 或其他框架的原生 API。
 

@@ -20,7 +20,8 @@
     "start": "electron .",
     "package": "npm run build && electron-builder --mac dir",
     "smoke:live": "node --import tsx scripts/live-smoke.ts",
-    "test:desktop": "node tests/desktop-smoke.mjs"
+    "test:desktop": "node tests/desktop-smoke.mjs",
+    "test:desktop:reuse": "node tests/desktop-research-reuse.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.85.1",

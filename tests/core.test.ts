@@ -6,7 +6,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, symlinkSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { createAppService, type AppService } from '../src/core/service.js';
+import { createAppService, AppService } from '../src/core/service.js';
 import { parseCommand, validatePlan } from '../src/core/validation.js';
 import { Store, id, now } from '../src/core/store.js';
 import type { Runner, RunnerRequest, RunnerCallbacks } from '../src/runtime/contracts.js';
@@ -657,12 +657,12 @@ test('actual read metadata is structural and partial or implicit reads keep cove
  const [first,second]=done.runs.filter(r=>r.purpose==='node');assert.equal(first!.inputCoverage,'declared');assert.equal(first!.reads![0]!.sourceDigest,createHash('sha256').update('original\n').digest('hex'));assert.equal(second!.inputCoverage,'unknown');assert.deepEqual(second!.reads,[]);
 });
 
-test('retry invalidates prior shared-context attempts and rejects changes to explicitly read dependency files',async t=>{
+test('retry retains independent research and rejects changes to explicitly read dependency files',async t=>{
  const plan:PlanDraft={sequence:1,summary:'Inspect shared configuration',observations:[],nodes:['a','b','c'].map(id=>({id,title:id,goal:'Read configuration',kind:'research',dependsOn:[],inputs:[{kind:'file',path:id==='c'?'check.mjs':'node_modules/config.txt',expect:'present'}],outputs:[{id:'summary',kind:'text'}],checkIds:[]}))};
  const runner:Runner={async run(r,c,signal){await c.onControl(r.purpose==='planning'?{kind:'update_plan',draft:plan,submit:true}:{kind:'complete',summary:'Inspected configuration'});return {summary:'done',turns:1,aborted:signal.aborted};}};
  const {app,project,source}=await setup(t,runner);mkdirSync(join(source,'node_modules'));writeFileSync(join(source,'node_modules/config.txt'),'first');execFileSync('git',['add','node_modules/config.txt'],{cwd:source,stdio:'ignore'});execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.org','commit','-m','Add dependency fixture'],{cwd:source,stdio:'ignore',env:{...process.env,GIT_CONFIG_GLOBAL:'/dev/null',GIT_CONFIG_NOSYSTEM:'1'}});
  const created=await app.command(create(project,{interaction:'conversation',checks:[]})) as TaskSnapshot;const ready=await until(app,created.task.id,s=>s.task.status==='ready');await app.command({type:'task.resume',taskId:created.task.id,expectedRevision:1});const done=await until(app,created.task.id,s=>s.task.status==='idle');
- writeFileSync(join(ready.task.workdir,'node_modules/config.txt'),'second');const preview=await app.command({type:'task.previewRetry',taskId:created.task.id,nodeId:'a',expectedRevision:1}) as ImpactPreview;assert.deepEqual(preview.affected,['a','b','c']);assert.deepEqual(preview.retained,[]);
+ writeFileSync(join(ready.task.workdir,'node_modules/config.txt'),'second');const preview=await app.command({type:'task.previewRetry',taskId:created.task.id,nodeId:'a',expectedRevision:1}) as ImpactPreview;assert.deepEqual(preview.affected,['a','b']);assert.deepEqual(preview.retained,['c']);
  writeFileSync(join(ready.task.workdir,'node_modules/config.txt'),'third');await assert.rejects(app.command({type:'task.applyImpact',requestId:id(),preview}),/changed/);const paused=await app.command({type:'task.snapshot',taskId:created.task.id}) as TaskSnapshot;assert.equal(paused.task.status,'paused');assert.deepEqual(paused.runs,done.runs);assert.equal(readFileSync(join(paused.task.workdir,'node_modules/config.txt'),'utf8'),'third');
 });
 
@@ -879,4 +879,100 @@ test('file intent validates original path, raw preimage, expected output and ope
   const created=await app.command(create(project,{executionPolicy:'autoWithinGrant'})) as TaskSnapshot;const blocked=await until(app,created.task.id,s=>s.task.status==='blocked');
   assert.equal(effects,0);assert.equal(readFileSync(join(blocked.task.workdir,'sample.txt'),'utf8'),'original\n');
  }
+});
+
+async function researchRetryFixture(t:any, read?:'actual'|'search'|'overlap') {
+ const requests:RunnerRequest[]=[];
+ const plan:PlanDraft={sequence:1,summary:'Research the check, then update and review the sample',observations:[{kind:'fact',text:'Global planner detail must not enter isolated research'}],nodes:[
+  {id:'research',title:'Inspect checks',goal:'Describe the check contract',kind:'research',dependsOn:[],inputs:[{kind:'file',path:'check.mjs',expect:'present'}],outputs:[{id:'summary',kind:'text'}],checkIds:[]},
+  {id:'edit',title:'Edit sample',goal:'Update the sample',kind:'edit',dependsOn:[],inputs:[{kind:'file',path:'sample.txt',expect:'present'}],outputs:[{id:'sample',kind:'file',path:'sample.txt',expect:'present'}],checkIds:[]},
+  {id:'verify',title:'Read both results',goal:'Report the sample with the check contract',kind:'research',dependsOn:['research','edit'],inputs:[{kind:'artifact',nodeId:'research',outputId:'summary'},{kind:'artifact',nodeId:'edit',outputId:'sample'}],outputs:[{id:'summary',kind:'text'}],checkIds:[]},
+ ]};
+ if(read==='overlap')plan.nodes[1]!.outputs.push({id:'check-source',kind:'file',path:'check.mjs',expect:'present'});
+ const runner:Runner={async run(r,c,signal){requests.push(r);if(r.purpose==='planning')await c.onControl({kind:'update_plan',draft:plan,submit:true});else{
+  if(r.node!.id==='research'&&read&&read!=='overlap')await c.onTool({toolCallId:id(),name:read==='actual'?'read_file':'search_files',args:read==='actual'?{path:'sample.txt'}:{query:'original'}});
+  if(r.node!.id==='edit')await c.onTool({toolCallId:id(),name:'write_file',args:{path:'sample.txt',content:'updated\n'}});
+  await c.onControl({kind:'complete',summary:r.node!.id+' result'});
+ }return {summary:'done',turns:1,aborted:signal.aborted};}};
+ const fixture=await setup(t,runner);
+ if(read==='actual')(fixture.app as any).executor={execute:async(call:any,options:any,signal:AbortSignal)=>{if(call.name==='read_file'){const {source,content}=readFileSnapshot(options.workdir,call.args.path);return {text:content,source:{path:source.path,sourceDigest:source.sourceDigest!,complete:true}};}return executor.execute(call,options,signal);}};
+ const created=await fixture.app.command(create(fixture.project,{interaction:'conversation',checks:[],executionPolicy:'autoWithinGrant'})) as TaskSnapshot;
+ const first=await until(fixture.app,created.task.id,s=>['idle','blocked'].includes(s.task.status));assert.equal(first.task.status,'idle',first.task.error);
+ return {...fixture,first,plan,requests};
+}
+test('research reuse keeps the original attempt and outputs while retrying only affected work',async t=>{
+ const {app,first,requests}=await researchRetryFixture(t),taskId=first.task.id;
+ const original=first.nodes.find(n=>n.nodeId==='research')!,run=first.runs.find(r=>r.id===original.runId)!,outputs=first.artifacts.filter(a=>a.runId===run.id);
+ const prompt=requests.find(r=>r.node?.id==='research')!,context=JSON.parse(prompt.context);
+ assert.equal(prompt.plan,undefined);assert.equal(context.scope,'research-v1');assert.equal(context.previousRuns,undefined);assert.equal(context.workspaceDigest,undefined);assert.ok(run.researchContextDigest);
+ assert.equal(context.conversation.messages.some((m:any)=>m.role==='assistant'&&m.taskRevision===1),false);
+ writeFileSync(join(first.task.workdir,'sample.txt'),'manual change to preserve before retry\n');writeFileSync(join(first.task.workdir,'user-notes.txt'),'keep these notes\n');
+ const preview=await app.command({type:'task.previewRetry',taskId,nodeId:'edit',expectedRevision:1}) as ImpactPreview;
+ assert.deepEqual(preview.affected,['edit','verify']);assert.deepEqual(preview.retained,['research']);assert.match(preview.nodeReasons!.find(n=>n.nodeId==='research')!.reason,/unchanged/);
+ const applied=await app.command({type:'task.applyImpact',requestId:id(),preview}) as TaskSnapshot;
+ assert.equal(JSON.parse(requests.filter(r=>r.node?.id==='edit').at(-1)!.context).inputs[0].content,'manual change to preserve before retry\n');
+ assert.equal(applied.task.retryCheckpoint!.afterRunCount,first.runs.length);
+ const done=await until(app,taskId,s=>['idle','blocked'].includes(s.task.status));assert.equal(done.task.status,'idle',done.task.error);
+ assert.equal(done.nodes.find(n=>n.nodeId==='research')!.attempt,1);assert.equal(done.nodes.find(n=>n.nodeId==='research')!.runId,run.id);
+ assert.deepEqual(done.runs.find(r=>r.id===run.id),run);assert.deepEqual(done.artifacts.filter(a=>a.runId===run.id),outputs);
+ assert.equal(done.nodes.find(n=>n.nodeId==='research')!.outputDigest,original.outputDigest);
+ assert.equal(done.nodes.find(n=>n.nodeId==='edit')!.attempt,2);assert.equal(done.nodes.find(n=>n.nodeId==='verify')!.attempt,2);
+ assert.equal(requests.filter(r=>r.node?.id==='research').length,1);assert.equal(readFileSync(join(done.task.workdir,'user-notes.txt'),'utf8'),'keep these notes\n');
+ const consumer=done.runs.filter(r=>r.nodeId==='verify').at(-1)!;assert.equal(consumer.inputBindings![0]!.producerRunId,run.id);
+ assert.ok(done.events.some(e=>e.kind==='node.reused'&&e.runId===run.id));
+ const report=app.report(taskId);assert.ok(report.includes(preview.id));assert.ok(report.includes(run.researchContextDigest!));assert.ok(report.includes('node.reused'));
+});
+test('research reuse rejects changed direct reads, unknown coverage and legacy prompt records',async t=>{
+ for(const failure of ['declared','actual','search','legacy','language'] as const)await t.test(failure,async t=>{
+  const {app,first}=await researchRetryFixture(t,failure==='actual'?'actual':failure==='search'?'search':undefined);
+  if(failure==='declared')writeFileSync(join(first.task.workdir,'check.mjs'),'// new check contract\n');
+  if(failure==='actual')writeFileSync(join(first.task.workdir,'sample.txt'),'changed observed file\n');
+  if(failure==='legacy')app.store.update(first.task.id,s=>{delete s.runs.find(r=>r.nodeId==='research')!.researchContextDigest;});
+  if(failure==='language')await app.command({type:'settings.save',patch:{responseLanguage:'zh-CN'}});
+  const preview=await app.command({type:'task.previewRetry',taskId:first.task.id,nodeId:'edit',expectedRevision:1}) as ImpactPreview;
+  assert.deepEqual(preview.affected,['research','edit','verify']);assert.deepEqual(preview.retained,[]);
+  assert.notEqual(preview.nodeReasons!.find(n=>n.nodeId==='research')!.reason,'Research inputs and context are unchanged');
+ });
+});
+test('research reuse rejects a preview after output evidence changes without a file change',async t=>{
+ const {app,first,requests}=await researchRetryFixture(t),preview=await app.command({type:'task.previewRetry',taskId:first.task.id,nodeId:'edit',expectedRevision:1}) as ImpactPreview;
+ const count=requests.length;
+ app.store.update(first.task.id,s=>{s.artifacts.find(a=>a.nodeId==='research'&&a.outputId==='summary')!.content='changed saved output';});
+ await assert.rejects(app.command({type:'task.applyImpact',requestId:id(),preview}),/changed/);
+ assert.equal(requests.length,count);assert.equal(app.store.get(first.task.id).task.status,'paused');
+});
+test('research reuse is revoked if the retried step changes a retained input',async t=>{
+ const {app,first}=await researchRetryFixture(t,'overlap');let consumed=0;
+ (app as any).runner={async run(r:RunnerRequest,c:RunnerCallbacks,signal:AbortSignal){if(r.node!.id==='verify')consumed++;if(r.node!.id==='edit')await c.onTool({toolCallId:id(),name:'write_file',args:{path:'check.mjs',content:'// changed contract\n'}});await c.onControl({kind:'complete',summary:'changed'});return {summary:'changed',turns:1,aborted:signal.aborted};}};
+ const preview=await app.command({type:'task.previewRetry',taskId:first.task.id,nodeId:'edit',expectedRevision:1}) as ImpactPreview;assert.deepEqual(preview.retained,['research']);
+ await app.command({type:'task.applyImpact',requestId:id(),preview});const blocked=await until(app,first.task.id,s=>s.task.status==='blocked');
+ assert.equal(consumed,0);assert.equal(blocked.task.acceptedDigest,undefined);assert.equal(blocked.nodes.find(n=>n.nodeId==='research')!.status,'stale');assert.equal(blocked.nodes.find(n=>n.nodeId==='research')!.reused,undefined);
+ assert.equal(blocked.artifacts.filter(a=>a.nodeId==='research').length,first.artifacts.filter(a=>a.nodeId==='research').length);
+});
+test('research reuse checkpoint survives reconstruction and is cleared by a new task revision',async t=>{
+ const {app,first,dataDir,requests}=await researchRetryFixture(t),preview=await app.command({type:'task.previewRetry',taskId:first.task.id,nodeId:'edit',expectedRevision:1}) as ImpactPreview;
+ const runner=(app as any).runner;(app as any).enqueue=()=>{};
+ await app.command({type:'task.applyImpact',requestId:id(),preview});await app.shutdown();
+ const restored=createAppService({dataDir,secretStore:{get:()=>undefined,set:()=>{}},notify:()=>{},capabilities:{sandbox:true,platform:'darwin'},lockFd:-1,runner,executor});t.after(()=>restored.shutdown());
+ assert.ok(restored.store.get(first.task.id).task.retryCheckpoint);
+ await restored.command({type:'task.resume',taskId:first.task.id,expectedRevision:1});const done=await until(restored,first.task.id,s=>['idle','blocked'].includes(s.task.status));assert.equal(done.task.status,'idle',done.task.error);
+ assert.equal(requests.filter(r=>r.node?.id==='research').length,1);
+ (restored as any).enqueue=()=>{};const revision=await restored.command({type:'task.previewRevision',taskId:first.task.id,expectedRevision:1,objective:'Different task meaning'}) as ImpactPreview;
+ assert.deepEqual(revision.retained,[]);await restored.command({type:'task.applyImpact',requestId:id(),preview:revision});assert.equal(restored.store.get(first.task.id).task.retryCheckpoint,undefined);
+});
+
+test('research reuse checks shared predecessors once per snapshot and rechecks the next call',()=>{
+ const app=Object.create(AppService.prototype) as any;app.settings=()=>({responseLanguage:'task'});app.clean=(value:string)=>value;
+ const snapshot:any={task:{id:'task',revision:1,activePlanId:'plan',objective:'Summarize earlier findings',checks:[],interaction:'task'},plan:{sequence:1,summary:'Combine earlier findings',observations:[],nodes:[]},nodes:[],runs:[],artifacts:[],actions:[],decisions:[],events:[]};
+ const count=60;
+ for(let i=0;i<count;i++){
+  const node={id:'n'+i,title:'Synthesis '+i,goal:'Summarize earlier findings',kind:'research',dependsOn:Array.from({length:i},(_,j)=>'n'+j),inputs:Array.from({length:i},(_,j)=>({kind:'artifact',nodeId:'n'+j,outputId:'summary'})),outputs:[{kind:'text',id:'summary'}],checkIds:[]};
+  const run:any={id:'r'+i,nodeId:node.id,attempt:1,status:'succeeded',taskRevision:1,planId:'plan',inputCoverage:'declared',inputBindings:[],reads:[]};
+  snapshot.plan.nodes.push(node);snapshot.nodes.push({nodeId:node.id,runId:run.id,attempt:1,status:'finished'});snapshot.runs.push(run);snapshot.artifacts.push({id:'a'+i,nodeId:node.id,runId:run.id,outputId:'summary',content:'summary '+i,digest:createHash('sha256').update('summary '+i).digest('hex'),truncated:false});
+  run.inputBindings=app.bindInputs(snapshot,node);run.researchContextDigest=app.researchFrame(snapshot,node,run.inputBindings).digest;
+ }
+ validatePlan(snapshot.plan,[]);snapshot.nodes.forEach((node:any)=>node.reused={previewId:'preview',checkedAt:now()});
+ let frames=0;const original=app.researchFrame.bind(app);app.researchFrame=(...args:any[])=>{frames++;return original(...args);};
+ assert.equal(app.retainedResearchCurrent(snapshot),true);assert.equal(frames,count);
+ snapshot.artifacts[0].content='changed output';assert.equal(app.retainedResearchCurrent(snapshot),false);assert.equal(frames,count+1);
 });

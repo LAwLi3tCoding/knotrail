@@ -19,3 +19,4 @@ jobs:
       - run: npx playwright install chromium
       - run: npm run test:ui
       - run: node tests/desktop-smoke.mjs
+      - run: npm run test:desktop:reuse

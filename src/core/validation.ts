@@ -12,7 +12,7 @@ export const checksSchema=z.array(z.object({id:key,label:text,command:z.array(z.
 export const waitSchema=z.object({kind:z.literal('wait'),reason:text,minutes:z.number().int().min(1).max(43200),source:z.object({kind:z.enum(['workspace_file','project_file']),path}).strict(),condition:z.union([z.object({kind:z.enum(['changed','exists'])}).strict(),z.object({kind:z.literal('contains'),text:z.string().min(1).max(4096)}).strict()])}).strict();
 const secret=z.string().max(8192);
 const prefs=z.object({panelView:z.enum(['process','steps']),selectedNode:key.optional(),detailTab:z.enum(['overview','artifacts','checks','history']),mainView:z.enum(['chat','activity','changes']),toolPanel:z.enum(['files','terminal','preview']).nullable(),graphView:z.enum(['graph','list']),draft:z.string().max(32_000)}).strict();
-const impact=z.object({id:key,taskId:key,expectedRevision:revision,expectedPlanId:key.optional(),workspaceDigest:key,inputSourcesDigest:key.optional(),objective:text.optional(),checks:checksSchema.optional(),nodeId:key.optional(),affected:z.array(key),retained:z.array(key),reason:text}).strict();
+const impact=z.object({id:key,taskId:key,expectedRevision:revision,expectedPlanId:key.optional(),workspaceDigest:key,inputSourcesDigest:key.optional(),objective:text.optional(),checks:checksSchema.optional(),nodeId:key.optional(),affected:z.array(key),retained:z.array(key),reuseDigest:key.optional(),nodeReasons:z.array(z.object({nodeId:key,reason:text}).strict()).optional(),reason:text}).strict();
 const schemas:Record<string,z.ZodType>={
  'bootstrap':z.object({type:z.literal('bootstrap')}).strict(),
  'project.add':z.object({type:z.literal('project.add'),path:text}).strict(),

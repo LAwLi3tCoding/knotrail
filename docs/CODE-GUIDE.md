@@ -2,6 +2,8 @@
 
 对应当前工作区；先读 [原理与架构](../ARCHITECTURE.md)，再沿下面的调用链定位代码。本项目使用 TypeScript、React、Electron、pi SDK 和 Node 内置 SQLite，构建用 esbuild，未引入 ORM、通用工作流引擎或第二套模型循环。等待、维护及本轮快速会话已通过对应回归、独立复核和实际打包态验证；完整完成度见 [审查记录](COMPLETION-AUDIT.md)。
 
+研究复用入口：`service.ts` 的 `researchFrame`、`inputPreviews`、`researchReuseReason`、`retainedResearchCurrent`、`preview` 和 `continuationCurrent`；共享字段为 `Run.researchContextDigest`、`NodeState.reused`、`Task.retryCheckpoint`、`ImpactPreview.reuseDigest/nodeReasons`。详细契约见 [研究复用](RESEARCH-REUSE.md)。
+
 ## 1. 目录与责任
 
 | 入口 | 责任 |
@@ -177,7 +179,7 @@ Worker 使用已固定版本的 `@earendil-works/pi-coding-agent`。项目和全
 
 `Run.sourcePremises` 保存准入时的已知文件状态；`assertObservedInputs()` 在节点工具准入、complete 进入 check 前和产物发布事务中核对它、直接文件绑定和本次实际读取。对这些已知或实际读取来源，仅 edit/verify 声明的文件输出可变化，路径通过 safePath 规范化后比较。这不是完整写入白名单；未观察文件与命令隐含写入仍未全面追踪。artifact 输入仍使用保存的快照，不与当前文件比较。不能把检查开始时新采集的来源替代该 Run 已依赖的来源。`continuationCurrent()` 在后继 Run 准入事务和 final 检查建批时核对最近完成节点的 outputDigest/outputSourcesDigest；变化由 `invalidateSources()` 撤销当前资格，保留历史。该检查选取当前最近的完成节点或具有 suspendedState 的正常中断 Run。决定/等待收尾先调用 assertObservedInputs 核对非可变前提，再保存合法写入后的 workspaceDigest/sourcesDigest，并复查采集稳定性；因此正常写入不被误判为外部修改，中断期间的输入或输出变化仍会阻止旧产物消费。knownSources 使用截至所选 Run 的读取集合；显式失效时 NodeState.reason 撤销中断记录的继续资格，新 Run 准入会清除旧 reason。reconcile 复用此判定。workspace_file 等待的新观察若改变工作区，observeWait 先使旧节点失效，再按新输入运行；project_file 仍单独受 observation 约束，不能放过无关的工作区变化。维护复验不继承旧节点的完成前提。
 
-`Run.reads` 只采用 helper 的结构化 source，不解析输出里的 sha256 文本。Core 若进一步截断或脱敏，complete 会变为 false。`inputCoverage=declared` 只说明已跟踪声明及当前可记录的读取；列表、搜索、命令和不完整读取使其变为 unknown。当前提示仍包含全任务历史，重试保守撤销已有尝试的完成资格，未实现语义研究复用。
+`Run.reads` 只采用 helper 的结构化 source，不解析输出里的 sha256 文本。Core 若进一步截断或脱敏，complete 会变为 false。`inputCoverage=declared` 只说明已跟踪声明及当前可记录的读取；列表、搜索、命令和不完整读取使其变为 unknown。研究请求使用 research-v1 独立上下文；同计划重试可保留证据仍适用的成功研究，跨目标语义复用仍未实现。一次资格核对在递归输入绑定之间共享节点结果，避免共享前驱被指数级重复计算；每次准入和检查都新建 Map，不跨检查缓存。
 
 ## 6. 持久化和恢复
 

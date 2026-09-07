@@ -1587,3 +1587,37 @@ test('file postcondition evidence remains distinct from unknown execution in Eng
   await page.evaluate(()=>new Promise<void>(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve()))));
   await page.screenshot({path:test.info().outputPath('file-postcondition-zh-360.png')});
 });
+
+for (const width of [360, 1024]) test(`research reuse reasons and original run evidence are bilingual at ${width}px`, async ({ page }) => {
+ await page.setViewportSize({ width, height: 940 });await start(page,false);
+ if(width===360)await page.getByRole('button',{name:'Expand navigation',exact:true}).click();
+ await page.getByRole('button',{name:/Upgrade the adapter/}).click();
+ await page.evaluate(() => {
+  const state=(window as unknown as {uiTest:{snapshot:TaskSnapshot;change:(patch:Partial<TaskSnapshot>)=>void}}).uiTest;
+  const original=window.knotrail.command.bind(window.knotrail);
+  window.knotrail.command=async <T,>(command:AppCommand):Promise<T>=>{
+   const result=await original<T>(command);
+   if(command.type==='task.previewRetry')return {...result,nodeReasons:[{nodeId:'edit',reason:'Selected for retry'},{nodeId:'research',reason:'Research inputs and context are unchanged'}],affected:['edit'],retained:['research'],reason:'Retry reruns affected steps and retains only research with unchanged inputs and context. Current files and historical attempts are preserved.'} as T;
+   return result;
+  };
+  state.change({nodes:state.snapshot.nodes.map(node=>node.nodeId==='research'?{...node,reused:{previewId:'preview-1',checkedAt:'2026-09-07T01:00:00Z'}}:node)});
+ });
+ await page.locator('.tracker-step[data-node-id="research"] > summary').click();
+ await expect(page.getByTestId('research-reused').first()).toContainText('Research retained');
+ const original=await page.evaluate(()=>JSON.stringify((window as unknown as {uiTest:{snapshot:TaskSnapshot}}).uiTest.snapshot.runs));
+ await page.getByRole('button',{name:'Planning',exact:true}).click();
+ await page.getByRole('button',{name:'Steps',exact:true}).click();
+ await page.getByRole('button',{name:'Retry step',exact:true}).click();
+ await expect(page.locator('dialog.dialog')).toContainText('Research inputs and context are unchanged');
+ await page.locator('dialog.dialog').getByRole('button',{name:'Dismiss',exact:true}).click();
+ await page.evaluate(()=>window.knotrail.command({type:'settings.save',patch:{locale:'zh-CN'}}));
+ await page.getByRole('button',{name:'重做此步骤',exact:true}).click();
+ await expect(page.locator('dialog.dialog')).toContainText('研究输入与上下文未变化，可复用原结果。');
+ await expect(page.locator('dialog.dialog')).toContainText('已选择重试此步骤。');
+ await page.screenshot({path:test.info().outputPath(`research-reuse-zh-${width}.png`)});
+ await page.locator('dialog.dialog').getByRole('button',{name:'关闭',exact:true}).last().click();
+ if(width===360)await page.keyboard.press('Escape');
+ await expect(page.getByTestId('research-reused').first()).toContainText('已复用研究结果');
+ expect(await page.evaluate(()=>JSON.stringify((window as unknown as {uiTest:{snapshot:TaskSnapshot}}).uiTest.snapshot.runs))).toBe(original);
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);
+});

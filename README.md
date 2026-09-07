@@ -1,113 +1,132 @@
+[English](README.md) | [中文](README.zh.md)
+
 # Knotrail
 
-Knotrail 是基于 pi SDK 的本地编码 Agent 桌面应用。每项任务先形成结构化计划，再按节点执行；对话、工具活动、代码变更、验收结果和历史尝试都可以在同一个工作区查看。
+**A desktop coding agent with visible plans, step-by-step execution, and a history you can inspect.**
 
-主界面沿用 Codex 的任务导航与对话布局，参考 DSH 的活动视图和配置分组，以及 Catdesk 的工具面板组织方式。右侧规划栏独立开关，底部文件、终端和产物预览独立开关。界面支持简体中文与 English，模型回复语言单独设置。
+Knotrail brings the [pi SDK](https://github.com/earendil-works/pi) into a local desktop workbench. Start with a message, follow the plan as it takes shape, and open any step to see its inputs, tool calls, changes, and results. Continue the conversation in the same workspace as the task develops.
 
-本仓库包含可运行代码，不是静态交互演示。当前发布面向个人开发者的 macOS 本地使用；其他平台的执行入口会拒绝运行。模型服务需要自行配置，不包含模型账号或 API 使用额度。
+Built for developers who want to follow and direct an agent's work throughout a task. The app supports English and Simplified Chinese, with a separate setting for the model's response language.
 
-完整原方案仍在实现中。本地文件等待与维护复验已通过回归、独立复核和打包态验证。本轮加入主对话任务步骤、逐次工具/产物/决定记录，以及 Codex 登录适配。同计划局部重试已支持有依据的研究复用；跨目标复用、完整崩溃恢复实验和真实同题比较尚未完成。文件写入前的持久意图与中断后的状态查证已实现，当前验证见下述报告。本机安装与真实会话验收另见 [验证记录](docs/VALIDATION.md)。逐项状态见 [完成度审查](docs/COMPLETION-AUDIT.md)。
+[![CI](https://github.com/LAwLi3tCoding/knotrail/actions/workflows/verify.yml/badge.svg)](https://github.com/LAwLi3tCoding/knotrail/actions/workflows/verify.yml) · [MIT license](LICENSE) · **Early-stage · macOS**
 
-2026-09-07 范围调整：按用户要求暂停网络安全及权限绕过相关工作。未完成的 VM 接入改动已在本地单独保存，不包含在当前产品实现或安装包中。历史实验结果保留，不能标为完成。
+## Why Knotrail
 
-## 已实现的工作流程
+When requirements change halfway through a coding task, the next step depends on what has already happened: which files were read, which edits reached disk, which checks passed, and which findings still apply.
 
-- 默认新建快速会话：选择 Git 项目、输入消息即可开始，模型配置沿用全局设置。高级选项可设置验收、策略和预算，或切换为计划任务。
-- 在同一会话继续发送消息，保留工作区、历次计划、工具记录和对话历史；每条新消息仍先规划再执行。
-- pi 调研项目并提交计划草稿；主进程校验计划后，自动执行或等待用户开始。
-- 查看节点依赖、真实状态、工具输出、变更产物、检查结果与历次运行。每次运行绑定具体文件或前驱产物快照，可查看来源、内容摘要和交付范围；重试仅消费仍具当前资格的产物。
-- 在主对话回答决定；即使规划栏关闭，也不会漏掉待答问题。
-- 暂停、恢复、取消；修改要求、编辑固定验收和重做节点先显示影响，再应用修订。检查变更展示旧新命令与保护路径，历史保留原定义。
-- 用有限持续任务观察指定本地文件；条件未满足、来源不可达或连续重复已消费信息时，只重新观察，不调用模型。实际观察到新的状态变化后可以再次推进。
-- 用维护任务按周期运行固定验收，记录最近一次 healthy / unhealthy / unknown、检查批次和观察缺口；修复由用户明确发起。
-- 保存任务、事件和界面偏好，导出 Markdown 任务报告。
+Knotrail keeps that work attached to the plan. Each step has its own inputs, attempts, outputs, and check results. You can inspect the current state, review the effect of a change, and continue with the earlier records still available.
 
-影响处理采用保守规则：修改目标或固定验收会使原计划全部节点失去完成依据；重做节点会使该节点及其下游失效。已有文件和历史记录保留。同计划重试可保留输入、上下文和产物均可核对的独立研究，预览逐节点说明原因；不提供任意节点回滚。详细条件与代码链见 [研究复用](docs/RESEARCH-REUSE.md)。
+## What you can do
 
-## 快速开始
+- **Follow the plan as it develops.** A dedicated panel on the right shows planning drafts, the published plan, dependencies, and node progress. Toggle it independently; the conversation still shows task steps and questions that need your answer. Every task plans before execution, with a choice of automatic execution after validation or a pause for review.
+- **Inspect how each result was produced.** Open a run to see its captured file or predecessor-artifact inputs, tool arguments and outputs, code changes, checks, and recorded decisions. Earlier attempts remain accessible after a retry. Export the task as a Markdown report.
+- **Preview changes and retry selected work.** Review affected steps before applying a task revision or retry. Within the same plan, independent research can be retained when its recorded inputs, context, and outputs still match; each node shows why it will be reused or rerun. Changing the overall objective or acceptance checks starts a new revision and requires a new plan. Retrying uses the current files rather than rolling back the workspace.
+- **Define what counts as done.** Add fixed check commands and protect their definitions from agent edits. Results are tied to the task version and the workspace that was checked. A conversation without checks ends its turn without claiming verified success; a planned task without checks waits for manual acceptance.
+- **Run tasks that wait or check again later.** A bounded ongoing task can wait for a specified local file condition without repeatedly calling the model. Maintenance tasks rerun fixed checks on a schedule and record health and missed observations. These modes run while the app and computer are running; repairs are explicitly started by the user.
 
-需要 macOS、Git、Node.js 24 或更新版本。安装原生依赖时可能需要 Xcode Command Line Tools。
+## The workbench
+
+The interface uses a Codex-style project sidebar and central conversation, with activity and change views alongside an optional right planning panel. File, terminal, and artifact previews live in a separate bottom panel.
+
+| Area | What it shows |
+| --- | --- |
+| Projects and tasks | Project groups, conversations, scheduled tasks, and settings |
+| Conversation | Messages, task steps, recorded runs, and decisions to answer |
+| Planning panel | Drafts, node dependencies, progress, and current or historical plans |
+| Activity and changes | Tool events, outputs, and changes associated with each run |
+
+A typical task follows this flow:
+
+```mermaid
+flowchart LR
+    A[Message] --> B[Read and plan]
+    B --> C[Validate plan]
+    C --> D[Execute steps]
+    D --> E[Checks or review]
+    D --> F[Inputs, tools, and outputs]
+    E --> G[Result and history]
+    F --> G
+```
+
+Plan review can pause the flow before execution. A new message continues the conversation in the same workspace and starts another planning cycle. For acceptance checks, budgets, and ongoing tasks, use the advanced options.
+
+## Quick start
+
+**Requirements:** macOS, Git, and Node.js 24 or newer. Native dependencies may require Xcode Command Line Tools. Bring your own model connection; the repository includes no model account or usage credits.
 
 ```sh
+git clone https://github.com/LAwLi3tCoding/knotrail.git
+cd knotrail
 npm ci
 npm run dev
 ```
 
-`dev` 会先构建，再启动 Electron；目前修改源码后需要重新运行。只启动已经构建的应用可使用：
+The command builds the app and opens Electron. Rerun it after source changes.
 
-```sh
-npm run build
-npm start
+1. Open **Settings → Model**. Choose an existing Codex ChatGPT login, or configure an OpenAI-compatible Chat Completions service with its base URL, exact model ID, and API key if required. A compatible local service can also be used.
+2. Save the settings and check the connection. The Codex option checks the local login format and expiry; API mode checks the provider's `/models` response. Run a task to verify actual model and tool support.
+3. Open a clean Git repository with at least one commit, enter a message, and send it. Continue in the same conversation after the response.
+
+For a first task, try: “Explain how this project's main entry point reaches its core logic, and summarize the files involved.” To run fixed checks, expand the advanced options and enter a command as a JSON argument array, such as `["node", "check.mjs"]`, using a script that exists in your project.
+
+See the [user guide](docs/USER-GUIDE.md) for model setup, task modes, checks, and recovery.
+
+## Inside the repository
+
+Knotrail includes the desktop app and the runtime behind it: **Electron + React + TypeScript**, a **SQLite** task store, and **pi SDK** model sessions. The core owns task state; the UI sends commands and displays saved snapshots and events. Each task works in a separate Git worktree.
+
+```text
+src/desktop/     Electron main process, preload, and desktop integration
+src/renderer/    Bilingual React workbench and planning panel
+src/core/        Task lifecycle, plans, retries, persistence, and Git workspaces
+src/runtime/     pi sessions, model providers, and worker processes
+src/execution/   File and command execution on macOS
+src/shared/      Commands, snapshots, and shared types
 ```
 
-首次使用：
+The desktop layout draws on Codex, activity and configuration organization on [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), and tool-panel organization on Catdesk. Knotrail is an independent project.
 
-1. 打开「设置 → 模型」，选择认证方式。已有 Codex ChatGPT 登录可选「现有 Codex 登录」，不需要粘贴密钥；其他服务选「API 密钥 / 本地服务」。
-2. Codex 路径使用 pi 的 `openai-codex` 模型目录，界面为新配置填入 `gpt-6-astra`；最终访问权限以服务端为准。API 模式填写兼容 Chat Completions 的地址、准确模型 ID 和所需密钥。API 密钥由操作系统安全存储加密。
-3. 保存后检查连接。Codex 模式只检查本机登录格式与有效期；API 模式检查 `/models`。两者都需要实际任务验证工具调用。
-4. 打开一个已经有提交、工作区干净的 Git 仓库，在新会话输入消息并发送。后续直接在同一会话继续输入，无需重复配置。
-5. 需要固定验收或持续任务时，展开高级选项。例如用 JSON 数组 `["node", "check.mjs"]` 设置验收命令。无自动检查的会话一轮结束后等待下一条消息，不声称验收通过；计划任务仍要求人工验收。
-
-完整操作、命令示例与恢复方法见 [用户指南](docs/USER-GUIDE.md)。
-
-## 验证与构建
+## Development
 
 ```sh
-npm run typecheck
-npm test
-npm run build
+npm run check
 npx playwright install chromium
 npm run test:ui
+npm run test:desktop
+npm run test:desktop:reuse
 ```
 
-`npm run check` 执行类型检查、核心测试和构建。UI 测试单独执行：它使用真实 React 前端和可控 IPC 测试替身，验证交互与状态保存，不能替代真实模型和操作系统执行验证。
+`check` runs type checking, unit tests, and the build. UI tests use controlled IPC fixtures; desktop tests exercise Electron, the core, and pi with a scripted local model service. They verify application behavior, not real-model task quality. See [validation records](docs/VALIDATION.md) for evidence and the separate live-model workflow.
 
 ```sh
-npm run smoke:live
 npm run package
 ```
 
-`smoke:live` 用于独立检查真实模型链路，配置和结果应以该脚本的实际提示及验证文档为准。`package` 生成 macOS 应用目录；当前构建没有开发者签名、公证或自动更新服务。
+Packaging produces a macOS application directory under `release/`. The current build is unsigned and has no notarization or automatic update service.
 
-## 实现边界
+## Current scope
 
-| 项目 | 当前行为 |
+Knotrail is under active development. The working app includes planning, execution records, local persistence, selective research reuse within a plan, and local waiting and maintenance. Cross-objective research reuse and broader real-model task evaluation remain in progress.
+
+- Execution currently requires macOS. Projects must be clean Git roots with existing commits; symlinks and submodules are not supported.
+- One task executes at a time across the app. Scheduling depends on the app staying open and the computer being awake.
+- Task data stays on the local machine; requests and selected context go to the configured model service. Command execution does not load your shell configuration or inherit your credentials, and its network access is off by default.
+- Use trusted repositories and commands. The current sandbox is not a VM, and detached background processes may outlive task cancellation. See the [execution boundaries](docs/SECURITY.md).
+- Interrupted deterministic file writes can be checked against saved expected state; unresolved commands and other uncertain effects require user review. The app does not automatically commit, push, merge, or publish changes to your projects.
+
+## Documentation
+
+Detailed documentation is currently primarily in Chinese.
+
+| Document | Contents |
 | --- | --- |
-| 执行平台 | macOS `sandbox-exec`；不可用时拒绝执行 |
-| 项目输入 | Git 根目录，需要已有提交且工作区干净；当前不支持符号链接与子模块 |
-| 并发 | 整个应用一次只有一条活动任务执行，其他任务排队 |
-| 模型接入 | Codex ChatGPT 登录通过固定官方 Responses 地址；其他模型通过 OpenAI 兼容 Chat Completions；订阅登录与 API key 分别配置 |
-| 命令环境 | 不加载用户 shell 配置，不继承用户凭据；网络默认关闭，可显式开启 |
-| 恢复 | 确定性文件写入可核对保存的预期状态，匹配后保留文件并重新规划；命令及无法查证的动作仍需人工处置 |
-| 等待来源 | 仅任务工作区或所选原项目内的相对路径普通文本文件；支持内容变化、存在、包含文本；原项目观察不会自动同步文件 |
-| 调度 | 依赖 App 进程和本机运行；错过周期合并为一次当前观察并记录缺口，不补跑每个周期；退出、睡眠期间没有观察 |
-| 外部交付 | 查看和导出报告；不会自动提交、合并、推送或发布用户项目 |
+| [User guide](docs/USER-GUIDE.md) | Setup, conversation and task modes, checks, and recovery |
+| [Architecture](ARCHITECTURE.md) | Processes, task state, execution, and persistence |
+| [Code guide](docs/CODE-GUIDE.md) | Modules, contracts, and call paths |
+| [Research reuse](docs/RESEARCH-REUSE.md) | Eligibility, retry behavior, and retained evidence |
+| [Validation](docs/VALIDATION.md) | Test methods, recorded results, and evidence limits |
+| [Implementation status](docs/COMPLETION-AUDIT.md) | Detailed progress against the original plan |
 
-只运行可信仓库和命令。文件与网络沙箱不是虚拟机，主动脱离的后台进程可能无法随任务回收；本项目不作为运行恶意代码的隔离平台。
+## License
 
-## 代码入口
-
-```text
-src/desktop/     Electron 主进程、受限 preload、操作系统密钥存储
-src/core/        唯一状态写入口、SQLite、计划与影响校验、Git 工作区
-src/runtime/     pi SDK 会话与独立模型工作进程
-src/execution/   文件与命令执行、macOS 沙箱、所有者锁
-src/shared/      前后端命令与快照契约
-src/renderer/    双语 React 工作区、右侧规划、证据与工具面板
-```
-
-详细文档：
-
-- [用户指南](docs/USER-GUIDE.md)
-- [实现原理](ARCHITECTURE.md)
-- [代码指南](docs/CODE-GUIDE.md)
-- [验证记录与方法](docs/VALIDATION.md)
-- [安全边界](docs/SECURITY.md)
-
-根目录原始产品与研究方案保留了设计背景；实际能力和限制以代码、用户指南与验证结果为准。
-
-## 依赖与参考
-
-运行时基于 [pi-mono](https://github.com/badlogic/pi-mono)，扩展组织思路参考 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)。Knotrail 是独立项目，不代表上述项目或 Codex、Catdesk 的官方发行版本。
-
-MIT License，见 [LICENSE](LICENSE)。
+[MIT](LICENSE).
